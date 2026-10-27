@@ -91,8 +91,9 @@ class Placed {
   final int item, units;
   Placed(this.x, this.y, this.w, this.h, this.item, this.units);
 
-  Placed copyWith({double? x, double? y, double? w, double? h}) =>
-      Placed(x ?? this.x, y ?? this.y, w ?? this.w, h ?? this.h, item, units);
+  Placed copyWith({double? x, double? y, double? w, double? h, int? units}) =>
+      Placed(x ?? this.x, y ?? this.y, w ?? this.w, h ?? this.h, item,
+          units ?? this.units);
 }
 
 class PackResult {
@@ -217,6 +218,34 @@ List<RowInfo> buildRows(List<Placed> placed) {
     r.stacks[p.item] = (r.stacks[p.item] ?? 0) + 1;
   }
   return rows;
+}
+
+/// ترقيم كل عمود بصيغة "صف.عمود" (مثلاً 1.2 = الصف 1 العمود 2)
+/// نفس تقسيم الصفوف بتاع buildRows، والأعمدة جوه الصف مترتبة من فوق لتحت.
+List<String> numbering(List<Placed> placed) {
+  final idx = List<int>.generate(placed.length, (i) => i)
+    ..sort((a, b) {
+      final d = placed[a].x.compareTo(placed[b].x);
+      return d != 0 ? d : placed[a].y.compareTo(placed[b].y);
+    });
+  final groups = <List<int>>[];
+  double gx = 0;
+  for (final i in idx) {
+    if (groups.isEmpty || (placed[i].x - gx).abs() > 1.0) {
+      groups.add([i]);
+      gx = placed[i].x;
+    } else {
+      groups.last.add(i);
+    }
+  }
+  final out = List<String>.filled(placed.length, '');
+  for (var r = 0; r < groups.length; r++) {
+    final g = groups[r]..sort((a, b) => placed[a].y.compareTo(placed[b].y));
+    for (var k = 0; k < g.length; k++) {
+      out[g[k]] = '${r + 1}.${k + 1}';
+    }
+  }
+  return out;
 }
 
 String _n(double v) =>
@@ -872,7 +901,7 @@ Future<Uint8List> buildReport(Calc c,
   g2.canvas.save();
   g2.canvas.translate(g2.left, g2.y);
   LoadPainter(c.L, c.W, scale, m, c.result.placed, c.items,
-          overlap: c.overlapIdx)
+          overlap: c.overlapIdx, showNums: true)
       .paint(g2.canvas, Size(dw, dh));
   g2.canvas.restore();
   g2.y += dh + 6;
@@ -904,7 +933,7 @@ Future<Uint8List> buildReport(Calc c,
   }
   g2.y = ly + 22;
   g2.para(
-      'الأرقام فوق الرسم = رقم الصف.  المكتوب على كل جهاز = نوع الجهاز وتحته عدد الأدوار.  الخط الأحمر = ناحية الباب.  الأحمر على الجهاز = خارج الحاوية أو متداخل.',
+      'الأرقام فوق الرسم = رقم الصف.  الرقم الصغير على كل جهاز = صف.عمود (مثلاً 1.2 = الصف 1 العمود 2).  المكتوب على الجهاز = نوعه وتحته عدد الأدوار.  الخط الأحمر = ناحية الباب.  الأحمر على الجهاز = خارج الحاوية أو متداخل.',
       fs: 9,
       color: const Color(0xFF616161));
 
@@ -994,6 +1023,7 @@ class _PlannerPageState extends State<PlannerPage> {
   String? error;
   bool exporting = false;
   double zoom = 1.0;
+  bool showNums = true;
 
   // وضع التعديل بإيدك
   bool editMode = false;
@@ -1001,6 +1031,7 @@ class _PlannerPageState extends State<PlannerPage> {
   int? sel; // رقم العمود المختار
   int? _drag; // رقم العمود اللي بيتسحب
   Offset _grab = Offset.zero; // مكان الإمساك جوه الجهاز (سم)
+  Offset _dtPos = Offset.zero; // مكان الضغطة المزدوجة
   int _step = 5;
   final List<List<Placed>> _undo = [];
 
@@ -1183,6 +1214,26 @@ class _PlannerPageState extends State<PlannerPage> {
     });
   }
 
+  // حاوية فاضية: ترسم فيها بإيدك من الصفر
+  void _startBlank() {
+    FocusScope.of(context).unfocus();
+    final inp = _readInputs();
+    if (inp == null) return;
+    final items = [for (final e in inp.items) e.pose == 0 ? e.withPose(1) : e];
+    setState(() {
+      error = null;
+      _resetEdit();
+      editMode = true;
+      result = Calc(PackResult([], List<int>.filled(items.length, 0)), inp.L,
+          inp.W, inp.H, _p(cPayload.text), items,
+          manual: true,
+          edited: true,
+          notes: const [
+            'حاوية فاضية: اضغط "إضافة عمود" واختار الجهاز، وبعدها حرّكه بإيدك'
+          ]);
+    });
+  }
+
   // ---------- التعديل بإيدك ----------
 
   void _pushUndo() {
@@ -1277,16 +1328,38 @@ class _PlannerPageState extends State<PlannerPage> {
     });
   }
 
+  // لف 90 درجة (بيبدّل الطول مع العرض في الرسمة) - لازم جوه setState
+  void _rotateIdx(int i) {
+    final pl = result!.result.placed;
+    if (i < 0 || i >= pl.length) return;
+    _pushUndo();
+    final p = pl[i];
+    final np = [...pl];
+    np[i] = p.copyWith(w: p.h, h: p.w);
+    _applyPlaced(np);
+  }
+
   void _rotateSel() {
     final i = sel;
     if (i == null) return;
-    final pl = result!.result.placed;
+    setState(() => _rotateIdx(i));
+  }
+
+  void _setUnits(int d) {
+    final i = sel;
+    if (i == null) return;
+    final c = result!;
+    final pl = c.result.placed;
     if (i >= pl.length) return;
+    final p = pl[i];
+    final it = c.items[p.item];
+    final mx = max(1, (c.H / it.fh + 1e-9).floor());
+    final nu = min(mx, max(1, p.units + d));
+    if (nu == p.units) return;
     setState(() {
       _pushUndo();
-      final p = pl[i];
       final np = [...pl];
-      np[i] = p.copyWith(w: p.h, h: p.w);
+      np[i] = p.copyWith(units: nu);
       _applyPlaced(np);
     });
   }
@@ -1294,12 +1367,14 @@ class _PlannerPageState extends State<PlannerPage> {
   void _copySel() {
     final i = sel;
     if (i == null) return;
-    final pl = result!.result.placed;
+    final c = result!;
+    final pl = c.result.placed;
     if (i >= pl.length) return;
     setState(() {
       _pushUndo();
       final p = pl[i];
-      final np = [...pl, p.copyWith(x: p.x + p.w)];
+      final spot = _freeSpot(c, p.w, p.h);
+      final np = [...pl, p.copyWith(x: spot.dx, y: spot.dy)];
       _applyPlaced(np);
       sel = np.length - 1;
     });
@@ -1318,13 +1393,61 @@ class _PlannerPageState extends State<PlannerPage> {
     });
   }
 
+  // فضّي الحاوية بالكامل
+  void _clearAll() {
+    final c = result;
+    if (c == null || c.result.placed.isEmpty) return;
+    setState(() {
+      _pushUndo();
+      _applyPlaced(<Placed>[]);
+      sel = null;
+    });
+  }
+
+  // أول مكان فاضي جوه الحاوية (من المقدمة، وبعدين العرض)
+  Offset _freeSpot(Calc c, double w, double h) {
+    final pl = c.result.placed;
+    final cands = <Offset>[const Offset(0, 0)];
+    for (final p in pl) {
+      cands.add(Offset(p.x + p.w, p.y));
+      cands.add(Offset(p.x, p.y + p.h));
+      cands.add(Offset(p.x + p.w, 0));
+    }
+    cands.sort((a, b) {
+      final d = a.dx.compareTo(b.dx);
+      return d != 0 ? d : a.dy.compareTo(b.dy);
+    });
+    for (final insideOnly in [true, false]) {
+      for (final o in cands) {
+        if (o.dy + h > c.W + 0.5) continue;
+        if (insideOnly && o.dx + w > c.L + 0.5) continue;
+        var ok = true;
+        for (final p in pl) {
+          if (o.dx < p.x + p.w - 0.5 &&
+              p.x < o.dx + w - 0.5 &&
+              o.dy < p.y + p.h - 0.5 &&
+              p.y < o.dy + h - 0.5) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) return o;
+      }
+    }
+    return Offset(c.usedLen, 0);
+  }
+
   void _addColumn(int i) {
     final c = result!;
     final it = c.items[i];
     final k = max(1, min(it.maxStack, (c.H / it.fh + 1e-9).floor()));
     setState(() {
       _pushUndo();
-      final np = [...c.result.placed, Placed(c.usedLen, 0, it.fl, it.fw, i, k)];
+      final spot = _freeSpot(c, it.fl, it.fw);
+      final np = [
+        ...c.result.placed,
+        Placed(spot.dx, spot.dy, it.fl, it.fw, i, k)
+      ];
       _applyPlaced(np);
       sel = np.length - 1;
     });
@@ -1498,6 +1621,7 @@ class _PlannerPageState extends State<PlannerPage> {
     final p = (sel != null && sel! < pl.length) ? pl[sel!] : null;
     final it = p == null ? null : c.items[p.item];
     final has = p != null;
+    final num = has ? numbering(pl)[sel!] : '';
 
     return Card(
       color: Colors.amber.shade50,
@@ -1506,8 +1630,8 @@ class _PlannerPageState extends State<PlannerPage> {
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text(
             has
-                ? 'المختار: ${it!.tag} (${p.units} أدوار) | ${_cm(p.w)}x${_cm(p.h)} سم | ${_cm(p.x)} سم من المقدمة و${_cm(p.y)} سم من الجنب'
-                : 'اضغط على جهاز لاختياره، أو اضغط ضغطة طويلة واسحبه عشان تحركه.',
+                ? 'المختار $num: ${it!.tag} | ${_cm(p.w)}x${_cm(p.h)} سم | ${_cm(p.x)} سم من المقدمة و${_cm(p.y)} سم من الجنب'
+                : 'اضغط على جهاز لاختياره، أو اضغط ضغطة طويلة واسحبه عشان تحركه، أو اضغط عليه ضغطتين عشان تلفه 90°.',
             style: const TextStyle(fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 6),
@@ -1551,6 +1675,22 @@ class _PlannerPageState extends State<PlannerPage> {
                 style: TextStyle(fontSize: 11, color: Colors.black54)),
           ),
           const SizedBox(height: 6),
+          Row(children: [
+            const Text('الأدوار في العمود:  '),
+            IconButton.filledTonal(
+                onPressed: has ? () => _setUnits(-1) : null,
+                icon: const Icon(Icons.remove)),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Text(has ? '${p.units}' : '-',
+                  style: const TextStyle(
+                      fontSize: 18, fontWeight: FontWeight.bold)),
+            ),
+            IconButton.filledTonal(
+                onPressed: has ? () => _setUnits(1) : null,
+                icon: const Icon(Icons.add)),
+          ]),
+          const SizedBox(height: 6),
           Wrap(spacing: 8, runSpacing: 4, children: [
             FilledButton.tonalIcon(
                 onPressed: has ? _rotateSel : null,
@@ -1568,6 +1708,10 @@ class _PlannerPageState extends State<PlannerPage> {
                 onPressed: _undo.isEmpty ? null : _undoOnce,
                 icon: const Icon(Icons.undo),
                 label: const Text('تراجع')),
+            FilledButton.tonalIcon(
+                onPressed: pl.isEmpty ? null : _clearAll,
+                icon: const Icon(Icons.layers_clear),
+                label: const Text('فضّي الحاوية')),
             PopupMenuButton<int>(
               onSelected: _addColumn,
               itemBuilder: (_) => [
@@ -1683,6 +1827,13 @@ class _PlannerPageState extends State<PlannerPage> {
       _title('الرسم (منظر علوي)'),
       SwitchListTile(
         contentPadding: EdgeInsets.zero,
+        value: showNums,
+        onChanged: (v) => setState(() => showNums = v),
+        title: const Text('ترقيم الأجهزة (صف.عمود)'),
+        subtitle: const Text('مثلاً 1.2 = الصف 1 العمود 2'),
+      ),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
         value: editMode,
         onChanged: (v) => setState(() {
           editMode = v;
@@ -1693,7 +1844,7 @@ class _PlannerPageState extends State<PlannerPage> {
         }),
         title: const Text('تعديل الرسمة بإيدك (زي اللعبة)'),
         subtitle: const Text(
-            'اضغط ضغطة طويلة على جهاز واسحبه. السحب العادي بيمرّر الرسمة.'),
+            'ضغطة طويلة + سحب = تحريك. ضغطتين = لف 90°. السحب العادي بيمرّر الرسمة.'),
       ),
       if (editMode) _editBar(c),
       Row(children: [
@@ -1721,7 +1872,9 @@ class _PlannerPageState extends State<PlannerPage> {
         final canvasW = CustomPaint(
           size: Size(cw, ch),
           painter: LoadPainter(c.L, c.W, scale, m, r.placed, c.items,
-              sel: editMode ? (sel ?? -1) : -1, overlap: ov),
+              sel: editMode ? (sel ?? -1) : -1,
+              overlap: ov,
+              showNums: showNums),
         );
 
         return Card(
@@ -1734,6 +1887,15 @@ class _PlannerPageState extends State<PlannerPage> {
                     behavior: HitTestBehavior.opaque,
                     onTapUp: (d) => setState(
                         () => sel = _hit(d.localPosition, scale, m)),
+                    onDoubleTapDown: (d) => _dtPos = d.localPosition,
+                    onDoubleTap: () {
+                      final i = _hit(_dtPos, scale, m);
+                      if (i == null) return;
+                      setState(() {
+                        sel = i;
+                        _rotateIdx(i);
+                      });
+                    },
                     onLongPressStart: (d) {
                       final i = _hit(d.localPosition, scale, m);
                       if (i == null) return;
@@ -1768,7 +1930,7 @@ class _PlannerPageState extends State<PlannerPage> {
         );
       }),
       const Text(
-          'المكتوب على كل جهاز = نوع الجهاز، وتحته عدد الأدوار. الخطوط المائلة = جهاز نايم. الخط الأحمر = ناحية الباب. الأحمر على الجهاز = خارج الحاوية أو متداخل. لو الحاوية طويلة صغّر الرسمة بالـ slider.',
+          'الرقم الصغير على الجهاز = صف.عمود. المكتوب في نصه = نوع الجهاز وتحته عدد الأدوار. الخطوط المائلة = جهاز نايم. الخط الأحمر = ناحية الباب. الأحمر على الجهاز = خارج الحاوية أو متداخل. لو الحاوية طويلة صغّر الرسمة بالـ slider.',
           style: TextStyle(fontSize: 12, color: Colors.black54)),
       const SizedBox(height: 24),
     ]);
@@ -1781,6 +1943,13 @@ class _PlannerPageState extends State<PlannerPage> {
     final nm = it.label.isEmpty ? it.name : '${it.name} (${it.label})';
 
     if (c.edited) {
+      if (it.qty > 0) {
+        final left = it.qty - got;
+        final tail = left > 0
+            ? '(فاضل $left مش متحط)'
+            : (left < 0 ? '(زيادة ${-left})' : '(الكل اتحط)');
+        return '$nm: $got من ${it.qty} $tail$pose';
+      }
       return '$nm: $got جهاز$pose';
     }
     if (c.manual) {
@@ -1897,10 +2066,16 @@ class _PlannerPageState extends State<PlannerPage> {
             icon: const Icon(Icons.edit_note),
             label: const Text('جرّب ترتيبي (بتعليماتي)'),
           ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: _startBlank,
+            icon: const Icon(Icons.draw),
+            label: const Text('افضي الحاوية وارسم بإيدك'),
+          ),
           const Padding(
             padding: EdgeInsets.only(top: 6),
             child: Text(
-                'ترتيبك: الأجهزة بتتحمّل من المقدمة للباب، وكل نوع في صفوف لوحده. لو الطول زاد عن الحاوية هيتكتب لك بالسنتي. وبعد الحساب تقدر تفعّل "تعديل الرسمة بإيدك" وتحرك الأجهزة.',
+                'ترتيبك: الأجهزة بتتحمّل من المقدمة للباب، وكل نوع في صفوف لوحده. لو الطول زاد عن الحاوية هيتكتب لك بالسنتي. "افضي الحاوية" بيفتح رسمة فاضية وإنت بتضيف الأعمدة وتحركها بإيدك.',
                 style: TextStyle(fontSize: 12, color: Colors.black54)),
           ),
           if (error != null)
@@ -1926,8 +2101,11 @@ class LoadPainter extends CustomPainter {
   final List<ItemSpec> items;
   final int sel; // العمود المختار (-1 = مفيش)
   final Set<int> overlap; // الأعمدة المتداخلة
+  final bool showNums; // ترقيم صف.عمود
   LoadPainter(this.L, this.W, this.scale, this.m, this.placed, this.items,
-      {this.sel = -1, this.overlap = const <int>{}});
+      {this.sel = -1,
+      this.overlap = const <int>{},
+      this.showNums = true});
 
   TextPainter _tp(String t, double fs, Color color) {
     return TextPainter(
@@ -1977,6 +2155,7 @@ class LoadPainter extends CustomPainter {
     final totW = max(W, usedW);
     final rem = max(0.0, L - used);
     final over = max(0.0, used - L);
+    final nums = showNums ? numbering(placed) : const <String>[];
 
     // المنطقة الفاضية
     if (rem > 0.5) {
@@ -2034,7 +2213,23 @@ class LoadPainter extends CustomPainter {
       final lines = <String>[it.tag];
       if (p.units > 1) lines.add('${p.units} أدوار');
       if (it.pose != 1) lines.add(it.poseShort);
-      _label(canvas, r, lines, Colors.white);
+      final lr = (showNums && r.height >= 40)
+          ? Rect.fromLTRB(r.left, r.top + 12, r.right, r.bottom)
+          : r;
+      _label(canvas, lr, lines, Colors.white);
+
+      // رقم الجهاز: صف.عمود
+      if (showNums && pi < nums.length) {
+        final tp = _tp(nums[pi], 9, Colors.white);
+        final bw = tp.width + 6, bh = tp.height + 2;
+        if (bw <= r.width - 3 && bh <= r.height - 3) {
+          final badge = Rect.fromLTWH(r.left + 1.5, r.top + 1.5, bw, bh);
+          canvas.drawRRect(
+              RRect.fromRectAndRadius(badge, const Radius.circular(3)),
+              Paint()..color = const Color(0xCC000000));
+          tp.paint(canvas, Offset(badge.left + 3, badge.top + 1));
+        }
+      }
     }
 
     // العمود المختار (إطار أصفر فوق كله)
@@ -2086,7 +2281,7 @@ class LoadPainter extends CustomPainter {
     final base = topPad + totW * s;
     final xUsed = m + used * s;
     final xEnd = m + L * s;
-    dim(m, xUsed, base + 14, 'المستخدم ${_cm(used)} سم',
+    dim(m, max(xUsed, m + 2), base + 14, 'المستخدم ${_cm(used)} سم',
         const Color(0xFF283593));
     if (over > 0.5) {
       dim(xEnd, xUsed, base + 50, 'زيادة عن الحاوية ${_cm(over)} سم',
