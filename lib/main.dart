@@ -1,6 +1,8 @@
 import 'dart:math';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
@@ -56,17 +58,19 @@ class ItemSpec {
     this.pose = 1,
   });
 
-  ItemSpec withPose(int p) => ItemSpec(
+  ItemSpec withPose(int p) => copy(pose: p);
+
+  ItemSpec copy({int? qty, int? maxStack, int? pose}) => ItemSpec(
         name: name,
         label: label,
         l: l,
         w: w,
         h: h,
         weight: weight,
-        qty: qty,
-        maxStack: maxStack,
+        qty: qty ?? this.qty,
+        maxStack: maxStack ?? this.maxStack,
         color: color,
-        pose: p,
+        pose: pose ?? this.pose,
       );
 
   // أبعاد الأرضية (fl × fw) والارتفاع الفعلي (fh) حسب الوضع
@@ -86,6 +90,9 @@ class Placed {
   final double x, y, w, h;
   final int item, units;
   Placed(this.x, this.y, this.w, this.h, this.item, this.units);
+
+  Placed copyWith({double? x, double? y, double? w, double? h}) =>
+      Placed(x ?? this.x, y ?? this.y, w ?? this.w, h ?? this.h, item, units);
 }
 
 class PackResult {
@@ -102,9 +109,14 @@ class Calc {
   final double L, W, H, payload;
   final List<ItemSpec> items;
   final bool manual;
+  final bool edited;
   final List<String> warnings;
+  final List<String> notes;
   Calc(this.result, this.L, this.W, this.H, this.payload, this.items,
-      {this.manual = false, this.warnings = const []});
+      {this.manual = false,
+      this.edited = false,
+      this.warnings = const [],
+      this.notes = const []});
 
   double get usedLen {
     double u = 0;
@@ -132,6 +144,27 @@ class Calc {
       if (p.x + p.w > L + 0.5) n += p.units;
     }
     return n;
+  }
+
+  // أرقام الأعمدة المتداخلة مع بعض
+  late final Set<int> overlapIdx = _calcOverlap();
+
+  Set<int> _calcOverlap() {
+    final s = <int>{};
+    final p = result.placed;
+    for (var i = 0; i < p.length; i++) {
+      for (var j = i + 1; j < p.length; j++) {
+        final a = p[i], b = p[j];
+        if (a.x < b.x + b.w - 0.5 &&
+            b.x < a.x + a.w - 0.5 &&
+            a.y < b.y + b.h - 0.5 &&
+            b.y < a.y + a.h - 0.5) {
+          s.add(i);
+          s.add(j);
+        }
+      }
+    }
+    return s;
   }
 }
 
@@ -202,6 +235,130 @@ String _normLabel(String s) {
     t = t.replaceAll(ar[i], '$i');
   }
   return t.replaceAll(RegExp(r'[*×✕Xx]'), 'x');
+}
+
+// ======================= فهم التعليمات المكتوبة =======================
+
+String _normAr(String s) {
+  var t = s.toLowerCase();
+  const ar = '٠١٢٣٤٥٦٧٨٩';
+  for (var i = 0; i < 10; i++) {
+    t = t.replaceAll(ar[i], '$i');
+  }
+  t = t
+      .replaceAll(RegExp('[\u064B-\u065F\u0640]'), '')
+      .replaceAll(RegExp('[أإآ]'), 'ا')
+      .replaceAll('ى', 'ي')
+      .replaceAll('ة', 'ه')
+      .replaceAll(RegExp('[×*✕]'), 'x')
+      .replaceAll(RegExp('[،,;؛:؟?!]'), ' ');
+  t = t.replaceAllMapped(
+      RegExp(r'(\d)\s*x\s*(\d)'), (m) => '${m[1]}x${m[2]}');
+  return t.replaceAll(RegExp(r'\s+'), ' ').trim();
+}
+
+class Instr {
+  int? qty, layers, across, pose, rot;
+  bool get any =>
+      qty != null ||
+      layers != null ||
+      across != null ||
+      pose != null ||
+      rot != null;
+}
+
+// بيدوّر على اسم الجهاز أو نوعه في السطر ويرجّع رقمه والباقي من السطر
+(int, String)? _findItem(String line, List<ItemSpec> items) {
+  var best = -1, bestLen = 0;
+  var rest = line;
+  for (var i = 0; i < items.length; i++) {
+    for (final raw in [items[i].name, items[i].label]) {
+      final k = _normAr(raw);
+      if (k.isEmpty || !line.contains(k)) continue;
+      if (k.length > bestLen) {
+        best = i;
+        bestLen = k.length;
+        rest = line.replaceFirst(k, ' ');
+      }
+    }
+  }
+  return best < 0 ? null : (best, rest);
+}
+
+Instr _parseInstr(String s0) {
+  var s = ' $s0 ';
+  final r = Instr();
+  const A = r'[\u0621-\u064A]*';
+  RegExpMatch? m;
+
+  // نحذف أي مقاسات زي 50x80 عشان ما تتاخدش كعدد
+  s = s.replaceAll(RegExp(r'\d+x\d+(?:x\d+)?'), ' ');
+
+  // الوضع
+  m = RegExp('ناي?م$A\\s*(?:علي\\s*)?(?:ال)?جنب$A').firstMatch(s);
+  if (m != null) {
+    r.pose = 3;
+    s = s.replaceFirst(m[0]!, ' ');
+  } else {
+    m = RegExp('ناي?م$A(?:\\s*علي)?(?:\\s*(?:ال)?(?:ظهر|واجهه|وش|وجه)$A)?')
+        .firstMatch(s);
+    if (m != null) {
+      r.pose = 2;
+      s = s.replaceFirst(m[0]!, ' ');
+    }
+  }
+  m = RegExp('واقف$A').firstMatch(s);
+  if (m != null) {
+    r.pose = 1;
+    s = s.replaceFirst(m[0]!, ' ');
+  }
+
+  // الاتجاه
+  m = RegExp('(?:^|\\s)(?:لف|لفه|مقلوب|عكس)(?:\\s*90)?(?=\\s|\$)')
+      .firstMatch(s);
+  if (m != null) {
+    r.rot = 2;
+    s = s.replaceFirst(m[0]!, ' ');
+  } else {
+    m = RegExp('عادي').firstMatch(s);
+    if (m != null) {
+      r.rot = 1;
+      s = s.replaceFirst(m[0]!, ' ');
+    }
+  }
+
+  // الأدوار
+  const lay = '(?:ادوار|طبقات|طبقه|طوابق|فوق بعض|دور)';
+  m = RegExp('(\\d+)\\s*$lay').firstMatch(s) ??
+      RegExp('$lay\\s*(\\d+)').firstMatch(s);
+  if (m != null) {
+    r.layers = int.tryParse(m[1]!);
+    s = s.replaceFirst(m[0]!, ' ');
+  }
+
+  // جنب بعض في العرض
+  const acr = '(?:جنب بعض|جنب|في العرض|بالعرض|عمود|عواميد)';
+  m = RegExp('(\\d+)\\s*$acr').firstMatch(s) ??
+      RegExp('$acr\\s*(\\d+)').firstMatch(s);
+  if (m != null) {
+    r.across = int.tryParse(m[1]!);
+    s = s.replaceFirst(m[0]!, ' ');
+  }
+
+  // العدد
+  m = RegExp(
+              '(\\d+)\\s*(?:جهاز|اجهزه|قطعه|قطع|وحده|وحدات|حته|حتت|كرتونه|كراتين|ماكينه|عدد)')
+          .firstMatch(s) ??
+      RegExp('عدد\\s*(\\d+)').firstMatch(s);
+  if (m != null) {
+    r.qty = int.tryParse(m[1]!);
+    s = s.replaceFirst(m[0]!, ' ');
+  }
+  if (r.qty == null) {
+    m = RegExp(r'(\d+)').firstMatch(s);
+    if (m != null) r.qty = int.tryParse(m[1]!);
+  }
+  return r;
 }
 
 // ======================= خوارزمية الترتيب (MaxRects) =======================
@@ -387,28 +544,138 @@ PackResult pack(double L, double W, double H, List<ItemSpec> items, int heur,
   return (PackResult(placed, loaded), warns);
 }
 
-// ======================= تقرير PDF =======================
+// ======================= تقرير PDF (بيترسم زي الشاشة) =======================
 
-PdfColor _pc(Color c) => PdfColor.fromInt(c.value);
+const double _pageW = 595.28, _pageH = 841.89;
 
-pw.Widget _c(String t,
-    {bool bold = false,
-    PdfColor? bg,
-    bool ltr = false,
-    double fs = 9.5,
-    pw.Alignment al = pw.Alignment.center}) {
-  return pw.Container(
-    color: bg,
-    padding: const pw.EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-    alignment: al,
-    child: pw.Text(
-      t,
-      textDirection: ltr ? pw.TextDirection.ltr : pw.TextDirection.rtl,
-      style: pw.TextStyle(
-          fontSize: fs,
-          fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal),
-    ),
-  );
+class _Cell {
+  final String t;
+  final bool bold;
+  final Color? bg;
+  final double fs;
+  final Color color;
+  final TextAlign align;
+  const _Cell(this.t,
+      {this.bold = false,
+      this.bg,
+      this.fs = 10,
+      this.color = Colors.black,
+      this.align = TextAlign.center});
+}
+
+TextPainter _rtp(
+    String t, double fs, Color col, bool bold, double w, TextAlign al) {
+  return TextPainter(
+    text: TextSpan(
+        text: t,
+        style: TextStyle(
+            color: col,
+            fontSize: fs,
+            height: 1.25,
+            fontWeight: bold ? FontWeight.bold : FontWeight.normal)),
+    textDirection: _isLtr(t) ? TextDirection.ltr : TextDirection.rtl,
+    textAlign: al,
+  )..layout(minWidth: w, maxWidth: w);
+}
+
+TextPainter _ntp(String t, double fs, Color col, bool bold) {
+  return TextPainter(
+    text: TextSpan(
+        text: t,
+        style: TextStyle(
+            color: col,
+            fontSize: fs,
+            fontWeight: bold ? FontWeight.bold : FontWeight.normal)),
+    textDirection: _isLtr(t) ? TextDirection.ltr : TextDirection.rtl,
+  )..layout();
+}
+
+class _Pager {
+  final double w, h, margin, ratio;
+  final List<ui.Picture> _done = [];
+  late ui.PictureRecorder _rec;
+  late Canvas canvas;
+  double y = 0;
+
+  _Pager(this.w, this.h, {this.margin = 28, this.ratio = 3}) {
+    _start();
+  }
+
+  double get cw => w - 2 * margin;
+  double get left => margin;
+  double get right => w - margin;
+
+  void _start() {
+    _rec = ui.PictureRecorder();
+    canvas = Canvas(_rec);
+    canvas.scale(ratio);
+    canvas.drawRect(Rect.fromLTWH(0, 0, w, h), Paint()..color = Colors.white);
+    y = margin;
+  }
+
+  void ensure(double need) {
+    if (y + need > h - margin && y > margin + 1) {
+      _done.add(_rec.endRecording());
+      _start();
+    }
+  }
+
+  void gap(double d) => y += d;
+
+  void para(String t,
+      {double fs = 10,
+      Color color = Colors.black,
+      bool bold = false,
+      TextAlign align = TextAlign.start}) {
+    final tp = _rtp(t, fs, color, bold, cw, align);
+    ensure(tp.height + 2);
+    tp.paint(canvas, Offset(left, y));
+    y += tp.height + 2;
+  }
+
+  // الجدول بيتكتب من اليمين لليسار (أول عمود على اليمين)
+  void table(List<double> flex, List<List<_Cell>> rows) {
+    final sum = flex.fold(0.0, (a, b) => a + b);
+    final widths = [for (final f in flex) f / sum * cw];
+    for (final cells in rows) {
+      final tps = <TextPainter>[];
+      var rh = 0.0;
+      for (var i = 0; i < cells.length; i++) {
+        final c = cells[i];
+        final tp =
+            _rtp(c.t, c.fs, c.color, c.bold, widths[i] - 8, c.align);
+        tps.add(tp);
+        rh = max(rh, tp.height + 8);
+      }
+      ensure(rh);
+      var x = right;
+      for (var i = 0; i < cells.length; i++) {
+        x -= widths[i];
+        final rect = Rect.fromLTWH(x, y, widths[i], rh);
+        final bg = cells[i].bg;
+        if (bg != null) canvas.drawRect(rect, Paint()..color = bg);
+        canvas.drawRect(
+            rect,
+            Paint()
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 0.6
+              ..color = const Color(0xFF757575));
+        tps[i].paint(canvas, Offset(x + 4, y + (rh - tps[i].height) / 2));
+      }
+      y += rh;
+    }
+  }
+
+  Future<List<Uint8List>> finish() async {
+    _done.add(_rec.endRecording());
+    final out = <Uint8List>[];
+    for (final p in _done) {
+      final img = await p.toImage((w * ratio).round(), (h * ratio).round());
+      final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+      out.add(bd!.buffer.asUint8List());
+    }
+    return out;
+  }
 }
 
 String _dateNow() {
@@ -427,467 +694,244 @@ String _rowText(RowInfo r, List<ItemSpec> items) {
   return parts.join('   |   ');
 }
 
-pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
-  final used = c.usedLen;
-  final totL = max(c.L, used);
-  final totW = max(c.W, c.usedWid);
-  final s = min(maxW / totL, maxH / totW);
-  final cw = c.L * s, ch = c.W * s, tw = totL * s;
-  const top = 16.0;
-  final baseY = top + totW * s;
-  final kids = <pw.Widget>[];
-
-  final rem = max(0.0, c.L - used);
-  final over = c.overflow;
-
-  kids.add(pw.Positioned(
-    left: 0,
-    top: top,
-    child: pw.Container(
-      width: cw,
-      height: ch,
-      decoration: pw.BoxDecoration(
-        color: PdfColors.grey200,
-        border: pw.Border.all(color: PdfColors.black, width: 1.5),
-      ),
-    ),
-  ));
-
-  // المنطقة الفاضية
-  if (rem > 0.5) {
-    kids.add(pw.Positioned(
-      left: used * s,
-      top: top + 1,
-      child: pw.Container(
-        width: max(rem * s - 1.5, 1.0),
-        height: ch - 2,
-        color: PdfColors.green50,
-        alignment: pw.Alignment.center,
-        child: rem * s >= 36
-            ? pw.Column(
-                mainAxisSize: pw.MainAxisSize.min,
-                children: [
-                  pw.Text('فاضي',
-                      textDirection: pw.TextDirection.rtl,
-                      style: pw.TextStyle(
-                          fontSize: 8,
-                          color: PdfColors.green900,
-                          fontWeight: pw.FontWeight.bold)),
-                  pw.Text('${_cm(rem)} سم',
-                      textDirection: pw.TextDirection.rtl,
-                      style: pw.TextStyle(
-                          fontSize: 8,
-                          color: PdfColors.green900,
-                          fontWeight: pw.FontWeight.bold)),
-                ],
-              )
-            : null,
-      ),
-    ));
-  }
-
-  for (final p in c.result.placed) {
-    final it = c.items[p.item];
-    final w = p.w * s, h = p.h * s;
-    final outside = p.x + p.w > c.L + 0.5 || p.y + p.h > c.W + 0.5;
-    final lines = <String>[it.tag];
-    if (p.units > 1) lines.add('${p.units} أدوار');
-    if (it.pose != 1) lines.add(it.poseShort);
-    final nLines = h >= 34 ? 3 : (h >= 22 ? 2 : (h >= 12 ? 1 : 0));
-    final show = w >= 22 ? lines.take(nLines).toList() : <String>[];
-    kids.add(pw.Positioned(
-      left: p.x * s,
-      top: top + p.y * s,
-      child: pw.Container(
-        width: w,
-        height: h,
-        alignment: pw.Alignment.center,
-        decoration: pw.BoxDecoration(
-          color: _pc(it.color),
-          border: outside
-              ? pw.Border.all(color: PdfColors.red, width: 1.6)
-              : pw.Border.all(color: PdfColors.grey900, width: 0.5),
-        ),
-        child: show.isEmpty
-            ? null
-            : pw.Column(
-                mainAxisSize: pw.MainAxisSize.min,
-                children: [
-                  for (final t in show)
-                    pw.Text(t,
-                        textDirection: _isLtr(t)
-                            ? pw.TextDirection.ltr
-                            : pw.TextDirection.rtl,
-                        style: pw.TextStyle(
-                            fontSize: 7,
-                            color: PdfColors.white,
-                            fontWeight: pw.FontWeight.bold)),
-                ],
-              ),
-      ),
-    ));
-  }
-
-  for (var i = 0; i < rows.length; i++) {
-    final r = rows[i];
-    kids.add(pw.Positioned(
-      left: r.x * s,
-      top: 0,
-      child: pw.SizedBox(
-        width: r.len * s,
-        child: pw.Center(
-          child: pw.Text('${i + 1}',
-              textDirection: pw.TextDirection.ltr,
-              style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold)),
-        ),
-      ),
-    ));
-  }
-
-  kids.add(pw.Positioned(
-    left: cw - 2,
-    top: top,
-    child: pw.Container(width: 4, height: ch, color: PdfColors.red),
-  ));
-  kids.add(pw.Positioned(
-    left: max(0.0, cw - 40),
-    top: baseY + 4,
-    child: pw.Text('الباب',
-        textDirection: pw.TextDirection.rtl,
-        style: pw.TextStyle(
-            fontSize: 9, color: PdfColors.red, fontWeight: pw.FontWeight.bold)),
-  ));
-  kids.add(pw.Positioned(
-    left: 0,
-    top: baseY + 4,
-    child: pw.Text('مقدمة الحاوية (أول صف)',
-        textDirection: pw.TextDirection.rtl,
-        style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700)),
-  ));
-
-  // خطوط القياس
-  List<pw.Widget> dim(
-      double xa, double xb, double y, PdfColor col, String label) {
-    final seg = max(xb - xa, 1.0);
-    final lw = max(seg, 130.0);
-    final lx = max(0.0, min((xa + xb) / 2 - lw / 2, tw - lw));
-    return [
-      pw.Positioned(
-          left: xa,
-          top: y,
-          child: pw.Container(width: seg, height: 1.2, color: col)),
-      pw.Positioned(
-          left: xa,
-          top: y - 4,
-          child: pw.Container(width: 1.2, height: 9, color: col)),
-      pw.Positioned(
-          left: max(xa, xb - 1.2),
-          top: y - 4,
-          child: pw.Container(width: 1.2, height: 9, color: col)),
-      pw.Positioned(
-        left: lx,
-        top: y + 5,
-        child: pw.SizedBox(
-          width: lw,
-          child: pw.Center(
-            child: pw.Text(label,
-                textDirection: pw.TextDirection.rtl,
-                style: pw.TextStyle(
-                    fontSize: 9, color: col, fontWeight: pw.FontWeight.bold)),
-          ),
-        ),
-      ),
-    ];
-  }
-
-  kids.addAll(dim(0, max(used * s, 2.0), baseY + 28, PdfColors.indigo,
-      'المستخدم ${_cm(used)} سم'));
-  if (over > 0.5) {
-    kids.addAll(dim(cw, used * s, baseY + 58, PdfColors.red,
-        'زيادة عن الحاوية ${_cm(over)} سم'));
-  } else if (rem > 0.5) {
-    kids.addAll(dim(used * s, cw, baseY + 58, PdfColors.green800,
-        'المتبقي ${_cm(rem)} سم'));
-  } else {
-    kids.add(pw.Positioned(
-      left: 0,
-      top: baseY + 52,
-      child: pw.Text('لا يوجد متبقي في طول الحاوية',
-          textDirection: pw.TextDirection.rtl,
-          style: pw.TextStyle(
-              fontSize: 9,
-              color: PdfColors.red,
-              fontWeight: pw.FontWeight.bold)),
-    ));
-  }
-
-  return pw.SizedBox(
-    width: tw,
-    height: baseY + 84,
-    child: pw.Stack(children: kids),
-  );
-}
-
 Future<Uint8List> buildReport(Calc c,
-    {required pw.Font regular,
-    required pw.Font bold,
-    required String customer,
+    {required String customer,
     required String vehicleNo,
     required String vehicleType}) async {
-  final doc = pw.Document();
-  final theme = pw.ThemeData.withFont(base: regular, bold: bold);
   final st = calcStats(c);
   final rows = buildRows(c.result.placed);
   final rem = max(0.0, c.L - st.usedLen);
   final over = c.overflow;
   final overweight = c.payload > 0 && st.weight > c.payload;
-  final hdrBg = PdfColors.grey300;
-  final lblBg = PdfColors.grey200;
+  const lblBg = Color(0xFFEEEEEE);
+  const hdrBg = Color(0xFFE0E0E0);
+  const red = Color(0xFFC62828);
+
+  _Cell lc(String t) => _Cell(t, bold: true, bg: lblBg);
+  _Cell vc(String t, {bool bold = false}) => _Cell(t, bold: bold);
+  _Cell hc(String t) => _Cell(t, bold: true, bg: hdrBg, fs: 9.5);
 
   // ---------- الورقة 1: التفاصيل ----------
-  doc.addPage(pw.MultiPage(
-    pageFormat: PdfPageFormat.a4,
-    margin: const pw.EdgeInsets.all(28),
-    textDirection: pw.TextDirection.rtl,
-    theme: theme,
-    build: (ctx) => [
-      pw.Center(
-        child: pw.Text('بيان تحميل',
-            textDirection: pw.TextDirection.rtl,
-            style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
-      ),
-      pw.SizedBox(height: 10),
-      pw.Table(
-        border: pw.TableBorder.all(color: PdfColors.grey600, width: 0.6),
-        columnWidths: {
-          0: pw.FlexColumnWidth(1.4),
-          1: pw.FlexColumnWidth(2),
-          2: pw.FlexColumnWidth(1.4),
-          3: pw.FlexColumnWidth(2),
-        },
-        children: [
-          pw.TableRow(children: [
-            _c('العميل', bold: true, bg: lblBg),
-            _c(customer.isEmpty ? '-' : customer),
-            _c('التاريخ', bold: true, bg: lblBg),
-            _c(_dateNow(), ltr: true),
-          ]),
-          pw.TableRow(children: [
-            _c('رقم الحاوية / السيارة', bold: true, bg: lblBg),
-            _c(vehicleNo.isEmpty ? '-' : vehicleNo, ltr: true),
-            _c('النوع', bold: true, bg: lblBg),
-            _c(vehicleType),
-          ]),
-          pw.TableRow(children: [
-            _c('مقاسات الحاوية (سم)', bold: true, bg: lblBg),
-            _c('${_n(c.L)} x ${_n(c.W)} x ${_n(c.H)}', ltr: true),
-            _c('إجمالي الأجهزة', bold: true, bg: lblBg),
-            _c('${c.result.total} جهاز', bold: true),
-          ]),
-          pw.TableRow(children: [
-            _c('الطول المستخدم (سم)', bold: true, bg: lblBg),
-            _c(_cm(st.usedLen), ltr: true),
-            _c(over > 0.5 ? 'الزيادة عن الحاوية (سم)' : 'الطول المتبقي (سم)',
-                bold: true, bg: lblBg),
-            _c(over > 0.5 ? _cm(over) : _cm(rem), ltr: true, bold: true),
-          ]),
-          pw.TableRow(children: [
-            _c('استغلال الأرضية', bold: true, bg: lblBg),
-            _c('${st.floorPct.toStringAsFixed(0)}%', ltr: true),
-            _c('استغلال الحجم', bold: true, bg: lblBg),
-            _c('${st.volPct.toStringAsFixed(0)}%', ltr: true),
-          ]),
-          pw.TableRow(children: [
-            _c('الوزن الكلي (كجم)', bold: true, bg: lblBg),
-            _c(st.weight > 0 ? st.weight.toStringAsFixed(0) : '-', ltr: true),
-            _c('الحمولة القصوى (كجم)', bold: true, bg: lblBg),
-            _c(c.payload > 0 ? c.payload.toStringAsFixed(0) : '-', ltr: true),
-          ]),
-        ],
-      ),
-      if (over > 0.5)
-        pw.Padding(
-          padding: const pw.EdgeInsets.only(top: 6),
-          child: pw.Text(
-              'تنبيه: الحمولة أطول من الحاوية بمقدار ${_cm(over)} سم (${c.outside} جهاز خارج الحاوية).',
-              textDirection: pw.TextDirection.rtl,
-              style: pw.TextStyle(
-                  color: PdfColors.red,
-                  fontSize: 11,
-                  fontWeight: pw.FontWeight.bold)),
-        ),
-      for (final w in c.warnings)
-        pw.Padding(
-          padding: const pw.EdgeInsets.only(top: 3),
-          child: pw.Text('تنبيه: $w',
-              textDirection: pw.TextDirection.rtl,
-              style: pw.TextStyle(
-                  color: PdfColors.red,
-                  fontSize: 10,
-                  fontWeight: pw.FontWeight.bold)),
-        ),
-      if (overweight)
-        pw.Padding(
-          padding: const pw.EdgeInsets.only(top: 6),
-          child: pw.Text('تنبيه: الوزن الكلي أكبر من الحمولة القصوى!',
-              textDirection: pw.TextDirection.rtl,
-              style: pw.TextStyle(
-                  color: PdfColors.red,
-                  fontSize: 11,
-                  fontWeight: pw.FontWeight.bold)),
-        ),
-      pw.SizedBox(height: 14),
-      pw.Text('ملخص الأنواع',
-          textDirection: pw.TextDirection.rtl,
-          style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold)),
-      pw.SizedBox(height: 4),
-      pw.Table(
-        border: pw.TableBorder.all(color: PdfColors.grey600, width: 0.6),
-        columnWidths: {
-          0: pw.FixedColumnWidth(24),
-          1: pw.FlexColumnWidth(2),
-          2: pw.FlexColumnWidth(2.2),
-          3: pw.FlexColumnWidth(1.9),
-          4: pw.FlexColumnWidth(1.3),
-          5: pw.FlexColumnWidth(1.3),
-          6: pw.FlexColumnWidth(1.2),
-          7: pw.FlexColumnWidth(1.1),
-          8: pw.FlexColumnWidth(1.4),
-        },
-        children: [
-          pw.TableRow(
-            decoration: pw.BoxDecoration(color: hdrBg),
-            children: [
-              _c('م', bold: true),
-              _c('الصنف', bold: true),
-              _c('المقاس (سم)', bold: true),
-              _c('الوضع', bold: true),
-              _c('المطلوب', bold: true),
-              _c('المحمّل', bold: true),
-              _c('الباقي', bold: true),
-              _c('الأدوار', bold: true),
-              _c('الوزن (كجم)', bold: true),
-            ],
-          ),
-          for (var i = 0; i < c.items.length; i++)
-            pw.TableRow(children: [
-              _c('${i + 1}', ltr: true),
-              _c(c.items[i].label.isEmpty
-                  ? c.items[i].name
-                  : '${c.items[i].name} (${c.items[i].label})'),
-              _c('${_n(c.items[i].l)}x${_n(c.items[i].w)}x${_n(c.items[i].h)}',
-                  ltr: true),
-              _c(c.items[i].poseName, fs: 8.5),
-              _c(c.items[i].qty == 0 ? 'أقصى كمية' : '${c.items[i].qty}'),
-              _c('${c.result.loaded[i]}', bold: true),
-              _c(c.items[i].qty == 0
-                  ? '-'
-                  : '${max(0, c.items[i].qty - c.result.loaded[i])}'),
-              _c('${c.items[i].maxStack}'),
-              _c(c.items[i].weight > 0
-                  ? (c.result.loaded[i] * c.items[i].weight).toStringAsFixed(0)
-                  : '-'),
-            ]),
-        ],
-      ),
-      pw.SizedBox(height: 14),
-      pw.Text('تفاصيل الصفوف (بالترتيب اللي بيتحمّل بيه)',
-          textDirection: pw.TextDirection.rtl,
-          style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold)),
-      pw.SizedBox(height: 4),
-      pw.Table(
-        border: pw.TableBorder.all(color: PdfColors.grey600, width: 0.6),
-        columnWidths: {
-          0: pw.FixedColumnWidth(34),
-          1: pw.FixedColumnWidth(62),
-          2: pw.FixedColumnWidth(58),
-          3: pw.FlexColumnWidth(1),
-        },
-        children: [
-          pw.TableRow(
-            decoration: pw.BoxDecoration(color: hdrBg),
-            children: [
-              _c('الصف', bold: true),
-              _c('يبدأ عند (سم)', bold: true),
-              _c('طول الصف', bold: true),
-              _c('المحتويات', bold: true),
-            ],
-          ),
-          for (var i = 0; i < rows.length; i++)
-            pw.TableRow(children: [
-              _c('${i + 1}', bold: true, ltr: true),
-              _c(_cm(rows[i].x), ltr: true),
-              _c(_cm(rows[i].len), ltr: true),
-              _c(_rowText(rows[i], c.items),
-                  fs: 9, al: pw.Alignment.centerRight),
-            ]),
-        ],
-      ),
-      pw.SizedBox(height: 8),
-      pw.Text(
-          'الصف رقم 1 هو أول صف بيتحمّل (ناحية مقدمة الحاوية)، وآخر صف عند الباب.',
-          textDirection: pw.TextDirection.rtl,
-          style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700)),
+  final g1 = _Pager(_pageW, _pageH);
+  g1.para('بيان تحميل', fs: 22, bold: true, align: TextAlign.center);
+  g1.gap(8);
+  g1.table([
+    1.4,
+    2,
+    1.4,
+    2
+  ], [
+    [
+      lc('العميل'),
+      vc(customer.isEmpty ? '-' : customer),
+      lc('التاريخ'),
+      vc(_dateNow())
     ],
-  ));
+    [
+      lc('رقم الحاوية / السيارة'),
+      vc(vehicleNo.isEmpty ? '-' : vehicleNo),
+      lc('النوع'),
+      vc(vehicleType)
+    ],
+    [
+      lc('مقاسات الحاوية (سم)'),
+      vc('${_n(c.L)} x ${_n(c.W)} x ${_n(c.H)}'),
+      lc('إجمالي الأجهزة'),
+      vc('${c.result.total} جهاز', bold: true)
+    ],
+    [
+      lc('الطول المستخدم (سم)'),
+      vc(_cm(st.usedLen)),
+      lc(over > 0.5 ? 'الزيادة عن الحاوية (سم)' : 'الطول المتبقي (سم)'),
+      vc(over > 0.5 ? _cm(over) : _cm(rem), bold: true)
+    ],
+    [
+      lc('استغلال الأرضية'),
+      vc('${st.floorPct.toStringAsFixed(0)}%'),
+      lc('استغلال الحجم'),
+      vc('${st.volPct.toStringAsFixed(0)}%')
+    ],
+    [
+      lc('الوزن الكلي (كجم)'),
+      vc(st.weight > 0 ? st.weight.toStringAsFixed(0) : '-'),
+      lc('الحمولة القصوى (كجم)'),
+      vc(c.payload > 0 ? c.payload.toStringAsFixed(0) : '-')
+    ],
+  ]);
 
-  // ---------- الورقة 2: الرسمة ----------
-  doc.addPage(pw.Page(
-    pageFormat: PdfPageFormat.a4.landscape,
-    margin: const pw.EdgeInsets.all(24),
-    textDirection: pw.TextDirection.rtl,
-    theme: theme,
-    build: (ctx) {
-      return pw.Column(
-        crossAxisAlignment: pw.CrossAxisAlignment.start,
-        children: [
-          pw.Row(
-            mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-            children: [
-              pw.Text('رسم التحميل - منظر علوي',
-                  textDirection: pw.TextDirection.rtl,
-                  style: pw.TextStyle(
-                      fontSize: 18, fontWeight: pw.FontWeight.bold)),
-              pw.Text(
-                  '${customer.isEmpty ? '' : '$customer  -  '}$vehicleType  -  ${c.result.total} جهاز',
-                  textDirection: pw.TextDirection.rtl,
-                  style: const pw.TextStyle(fontSize: 11)),
-            ],
-          ),
-          pw.SizedBox(height: 10),
-          _topViewPdf(c, rows, 794, 290),
-          pw.SizedBox(height: 6),
-          pw.Text(
-              'الطول ${_n(c.L)} سم  -  العرض ${_n(c.W)} سم   |   الطول المستخدم ${_cm(st.usedLen)} سم   |   ${over > 0.5 ? 'زيادة عن الحاوية ${_cm(over)} سم' : 'المتبقي ${_cm(rem)} سم'}',
-              textDirection: pw.TextDirection.rtl,
-              style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 10),
-          pw.Wrap(
-            spacing: 18,
-            runSpacing: 6,
-            children: [
-              for (var i = 0; i < c.items.length; i++)
-                pw.Row(mainAxisSize: pw.MainAxisSize.min, children: [
-                  pw.Container(
-                      width: 11, height: 11, color: _pc(c.items[i].color)),
-                  pw.SizedBox(width: 5),
-                  pw.Text(
-                      '${c.items[i].tag}${c.items[i].poseShort.isEmpty ? '' : ' (${c.items[i].poseShort})'}  =  ${c.result.loaded[i]} جهاز',
-                      textDirection: pw.TextDirection.rtl,
-                      style: const pw.TextStyle(fontSize: 10)),
-                ]),
-            ],
-          ),
-          pw.SizedBox(height: 10),
-          pw.Text(
-              'الأرقام فوق الرسم = رقم الصف.  المكتوب على كل جهاز = نوع الجهاز وتحته عدد الأدوار.  الخط الأحمر = ناحية الباب.  الإطار الأحمر على الجهاز = خارج الحاوية.',
-              textDirection: pw.TextDirection.rtl,
-              style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700)),
-        ],
-      );
-    },
-  ));
+  if (over > 0.5) {
+    g1.gap(6);
+    g1.para(
+        'تنبيه: الحمولة أطول من الحاوية بمقدار ${_cm(over)} سم (${c.outside} جهاز خارج الحاوية).',
+        fs: 11,
+        bold: true,
+        color: red);
+  }
+  if (c.overlapIdx.isNotEmpty) {
+    g1.para('تنبيه: في ${c.overlapIdx.length} عمود متداخلين مع بعض في الرسمة.',
+        fs: 11, bold: true, color: red);
+  }
+  for (final w in c.warnings) {
+    g1.para('تنبيه: $w', fs: 10, bold: true, color: red);
+  }
+  if (overweight) {
+    g1.para('تنبيه: الوزن الكلي أكبر من الحمولة القصوى!',
+        fs: 11, bold: true, color: red);
+  }
 
+  g1.gap(12);
+  g1.para('ملخص الأنواع', fs: 13, bold: true);
+  g1.gap(2);
+  g1.table([
+    0.6,
+    2,
+    2.2,
+    1.9,
+    1.3,
+    1.3,
+    1.2,
+    1.1,
+    1.4
+  ], [
+    [
+      hc('م'),
+      hc('الصنف'),
+      hc('المقاس (سم)'),
+      hc('الوضع'),
+      hc('المطلوب'),
+      hc('المحمّل'),
+      hc('الباقي'),
+      hc('الأدوار'),
+      hc('الوزن (كجم)'),
+    ],
+    for (var i = 0; i < c.items.length; i++)
+      [
+        vc('${i + 1}'),
+        vc(c.items[i].label.isEmpty
+            ? c.items[i].name
+            : '${c.items[i].name} (${c.items[i].label})'),
+        vc('${_n(c.items[i].l)}x${_n(c.items[i].w)}x${_n(c.items[i].h)}'),
+        _Cell(c.items[i].poseName, fs: 8.5),
+        vc(c.items[i].qty == 0 ? 'أقصى كمية' : '${c.items[i].qty}'),
+        vc('${c.result.loaded[i]}', bold: true),
+        vc(c.items[i].qty == 0
+            ? '-'
+            : '${max(0, c.items[i].qty - c.result.loaded[i])}'),
+        vc('${c.items[i].maxStack}'),
+        vc(c.items[i].weight > 0
+            ? (c.result.loaded[i] * c.items[i].weight).toStringAsFixed(0)
+            : '-'),
+      ],
+  ]);
+
+  g1.gap(12);
+  g1.para('تفاصيل الصفوف (بالترتيب اللي بيتحمّل بيه)', fs: 13, bold: true);
+  g1.gap(2);
+  g1.table([
+    34,
+    62,
+    58,
+    385
+  ], [
+    [hc('الصف'), hc('يبدأ عند (سم)'), hc('طول الصف'), hc('المحتويات')],
+    for (var i = 0; i < rows.length; i++)
+      [
+        _Cell('${i + 1}', bold: true),
+        vc(_cm(rows[i].x)),
+        vc(_cm(rows[i].len)),
+        _Cell(_rowText(rows[i], c.items), fs: 9, align: TextAlign.start),
+      ],
+  ]);
+  g1.gap(8);
+  g1.para(
+      'الصف رقم 1 هو أول صف بيتحمّل (ناحية مقدمة الحاوية)، وآخر صف عند الباب.',
+      fs: 9,
+      color: const Color(0xFF616161));
+
+  // ---------- الورقة 2: الرسمة (أفقي) ----------
+  final g2 = _Pager(_pageH, _pageW, margin: 24);
+  final t1 = _rtp('رسم التحميل - منظر علوي', 18, Colors.black, true, g2.cw,
+      TextAlign.start);
+  t1.paint(g2.canvas, Offset(g2.left, g2.y));
+  final sub =
+      '${customer.isEmpty ? '' : '$customer  -  '}$vehicleType  -  ${c.result.total} جهاز';
+  final t2 = _rtp(sub, 11, Colors.black, false, g2.cw, TextAlign.end);
+  t2.paint(g2.canvas, Offset(g2.left, g2.y + 5));
+  g2.y += t1.height + 8;
+
+  const m = 16.0;
+  final totL = max(c.L, c.usedLen);
+  final totW = max(c.W, c.usedWid);
+  final availH = g2.h - g2.margin - g2.y - 100;
+  final scale = max(
+      0.05,
+      min((g2.cw - 2 * m) / totL,
+          (availH - LoadPainter.topPad - LoadPainter.bottomPad) / totW));
+  final dw = totL * scale + 2 * m;
+  final dh = LoadPainter.topPad + totW * scale + LoadPainter.bottomPad;
+  g2.canvas.save();
+  g2.canvas.translate(g2.left, g2.y);
+  LoadPainter(c.L, c.W, scale, m, c.result.placed, c.items,
+          overlap: c.overlapIdx)
+      .paint(g2.canvas, Size(dw, dh));
+  g2.canvas.restore();
+  g2.y += dh + 6;
+
+  g2.para(
+      'الطول ${_n(c.L)} سم  -  العرض ${_n(c.W)} سم   |   الطول المستخدم ${_cm(st.usedLen)} سم   |   ${over > 0.5 ? 'زيادة عن الحاوية ${_cm(over)} سم' : 'المتبقي ${_cm(rem)} سم'}',
+      fs: 10,
+      bold: true,
+      color: over > 0.5 ? red : Colors.black);
+  g2.gap(4);
+
+  // دليل الألوان
+  var lx = g2.right;
+  var ly = g2.y;
+  for (var i = 0; i < c.items.length; i++) {
+    final it = c.items[i];
+    final text =
+        '${it.tag}${it.poseShort.isEmpty ? '' : ' (${it.poseShort})'}  =  ${c.result.loaded[i]} جهاز';
+    final tp = _ntp(text, 10, Colors.black, false);
+    final need = 11 + 5 + tp.width + 18;
+    if (lx - need < g2.left && lx != g2.right) {
+      lx = g2.right;
+      ly += 18;
+    }
+    g2.canvas.drawRect(
+        Rect.fromLTWH(lx - 11, ly + 2, 11, 11), Paint()..color = it.color);
+    tp.paint(g2.canvas, Offset(lx - 11 - 5 - tp.width, ly));
+    lx -= need;
+  }
+  g2.y = ly + 22;
+  g2.para(
+      'الأرقام فوق الرسم = رقم الصف.  المكتوب على كل جهاز = نوع الجهاز وتحته عدد الأدوار.  الخط الأحمر = ناحية الباب.  الأحمر على الجهاز = خارج الحاوية أو متداخل.',
+      fs: 9,
+      color: const Color(0xFF616161));
+
+  // ---------- تجميع الـ PDF ----------
+  final imgs1 = await g1.finish();
+  final imgs2 = await g2.finish();
+  final doc = pw.Document();
+  for (final b in imgs1) {
+    doc.addPage(pw.Page(
+      pageFormat: PdfPageFormat.a4,
+      margin: pw.EdgeInsets.zero,
+      build: (_) => pw.FullPage(
+        ignoreMargins: true,
+        child: pw.Image(pw.MemoryImage(b), fit: pw.BoxFit.fill),
+      ),
+    ));
+  }
+  for (final b in imgs2) {
+    doc.addPage(pw.Page(
+      pageFormat: PdfPageFormat.a4.landscape,
+      margin: pw.EdgeInsets.zero,
+      build: (_) => pw.FullPage(
+        ignoreMargins: true,
+        child: pw.Image(pw.MemoryImage(b), fit: pw.BoxFit.fill),
+      ),
+    ));
+  }
   return await doc.save();
 }
 
@@ -944,15 +988,25 @@ class _PlannerPageState extends State<PlannerPage> {
   final cPayload = TextEditingController();
   final cCustomer = TextEditingController();
   final cVehicleNo = TextEditingController();
+  final cInstr = TextEditingController();
   final List<ItemForm> forms = [ItemForm()];
   Calc? result;
   String? error;
   bool exporting = false;
   double zoom = 1.0;
 
+  // وضع التعديل بإيدك
+  bool editMode = false;
+  bool snap = true;
+  int? sel; // رقم العمود المختار
+  int? _drag; // رقم العمود اللي بيتسحب
+  Offset _grab = Offset.zero; // مكان الإمساك جوه الجهاز (سم)
+  int _step = 5;
+  final List<List<Placed>> _undo = [];
+
   @override
   void dispose() {
-    for (final c in [cL, cW, cH, cPayload, cCustomer, cVehicleNo]) {
+    for (final c in [cL, cW, cH, cPayload, cCustomer, cVehicleNo, cInstr]) {
       c.dispose();
     }
     for (final f in forms) {
@@ -961,9 +1015,14 @@ class _PlannerPageState extends State<PlannerPage> {
     super.dispose();
   }
 
-  // بيقرا المدخلات ويتأكد منها. في الترتيب اليدوي لازم العدد يكون أكبر من 0.
-  ({double L, double W, double H, List<ItemSpec> items})? _readInputs(
-      {required bool manual}) {
+  void _resetEdit() {
+    _undo.clear();
+    sel = null;
+    _drag = null;
+  }
+
+  // بيقرا المدخلات ويتأكد منها
+  ({double L, double W, double H, List<ItemSpec> items})? _readInputs() {
     final L = _p(cL.text), W = _p(cW.text), H = _p(cH.text);
     if (L <= 0 || W <= 0 || H <= 0) {
       setState(() => error = 'دخّل مقاسات الحاوية أو السيارة صح');
@@ -977,12 +1036,6 @@ class _PlannerPageState extends State<PlannerPage> {
         setState(() => error = 'مقاسات الجهاز رقم ${i + 1} ناقصة');
         return null;
       }
-      final qty = max(0, _p(f.qty.text).round());
-      if (manual && qty == 0) {
-        setState(() => error =
-            'في ترتيبك لازم تكتب العدد للجهاز رقم ${i + 1} (مش 0)');
-        return null;
-      }
       items.add(ItemSpec(
         name: f.name.text.trim().isEmpty ? 'جهاز ${i + 1}' : f.name.text.trim(),
         label: _normLabel(f.label.text),
@@ -990,7 +1043,7 @@ class _PlannerPageState extends State<PlannerPage> {
         w: w,
         h: h,
         weight: _p(f.weight.text),
-        qty: qty,
+        qty: max(0, _p(f.qty.text).round()),
         maxStack: max(1, _p(f.stack.text).round()),
         color: _colors[i % _colors.length],
         pose: f.pose,
@@ -1002,7 +1055,7 @@ class _PlannerPageState extends State<PlannerPage> {
   // الترتيب التلقائي (أفضل ترتيب)
   void _calculate() {
     FocusScope.of(context).unfocus();
-    final inp = _readInputs(manual: false);
+    final inp = _readInputs();
     if (inp == null) return;
     final L = inp.L, W = inp.W, H = inp.H, items = inp.items;
 
@@ -1035,25 +1088,254 @@ class _PlannerPageState extends State<PlannerPage> {
     final finalItems = bestItems;
     setState(() {
       error = null;
+      _resetEdit();
       result = Calc(finalBest, L, W, H, _p(cPayload.text), finalItems);
     });
   }
 
-  // الترتيب اليدوي (بتعليمات المستخدم)
+  // الترتيب اليدوي: الخانات + التعليمات المكتوبة
   void _calculateManual() {
     FocusScope.of(context).unfocus();
-    final inp = _readInputs(manual: true);
+    final inp = _readInputs();
     if (inp == null) return;
-    final items = [
-      for (final e in inp.items) e.pose == 0 ? e.withPose(1) : e
-    ];
+    final base = inp.items;
+    final n = base.length;
+
+    final qty = [for (final e in base) e.qty];
+    final lay = [for (final e in base) e.maxStack];
     final across = [for (final f in forms) max(0, _p(f.across.text).round())];
     final rot = [for (final f in forms) f.rot];
-    final (r, warns) = packManual(inp.W, inp.H, items, across, rot);
+    final pose = [for (final e in base) e.pose == 0 ? 1 : e.pose];
+    final warns = <String>[];
+    final mentioned = <int>[];
+
+    final lines = cInstr.text
+        .split('\n')
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty);
+    for (final raw in lines) {
+      final ln = _normAr(raw);
+      var found = _findItem(ln, base);
+      if (found == null && n == 1) found = (0, ln);
+      if (found == null) {
+        warns.add('مش فاهم السطر "$raw" (ابدأه باسم الجهاز أو نوعه)');
+        continue;
+      }
+      final (idx, rest) = found;
+      final ins = _parseInstr(rest);
+      if (!ins.any) {
+        warns.add('السطر "$raw": مفهمتش منه أي تعليمات');
+        continue;
+      }
+      if (ins.qty != null) qty[idx] = ins.qty!;
+      if (ins.layers != null) lay[idx] = ins.layers!;
+      if (ins.across != null) across[idx] = ins.across!;
+      if (ins.pose != null) pose[idx] = ins.pose!;
+      if (ins.rot != null) rot[idx] = ins.rot!;
+      if (!mentioned.contains(idx)) mentioned.add(idx);
+    }
+
+    // الأجهزة اللي في التعليمات الأول بترتيب السطور، وبعدها الباقي
+    final order = [
+      ...mentioned,
+      for (var i = 0; i < n; i++)
+        if (!mentioned.contains(i)) i
+    ];
+
+    final items = <ItemSpec>[];
+    final acr = <int>[];
+    final rt = <int>[];
+    for (final i in order) {
+      if (qty[i] <= 0) {
+        warns.add('${base[i].tag}: العدد 0 فتجاهلته (اكتب العدد)');
+        continue;
+      }
+      items.add(
+          base[i].copy(qty: qty[i], maxStack: max(1, lay[i]), pose: pose[i]));
+      acr.add(across[i]);
+      rt.add(rot[i]);
+    }
+    if (items.isEmpty) {
+      setState(() => error = 'اكتب عدد الأجهزة (في الخانة أو في التعليمات)');
+      return;
+    }
+
+    final (r, w2) = packManual(inp.W, inp.H, items, acr, rt);
+
+    final notes = <String>[];
+    for (var k = 0; k < items.length; k++) {
+      final it = items[k];
+      final parts = <String>[
+        '${it.qty} جهاز',
+        acr[k] > 0 ? '${acr[k]} جنب بعض' : 'جنب بعض تلقائي',
+        '${it.maxStack} أدوار',
+      ];
+      if (it.pose != 1) parts.add(it.poseShort);
+      if (rt[k] == 2) parts.add('ملفوف 90°');
+      notes.add('${k + 1}. ${it.tag}: ${parts.join('، ')}');
+    }
+
     setState(() {
       error = null;
+      _resetEdit();
       result = Calc(r, inp.L, inp.W, inp.H, _p(cPayload.text), items,
-          manual: true, warnings: warns);
+          manual: true, warnings: [...warns, ...w2], notes: notes);
+    });
+  }
+
+  // ---------- التعديل بإيدك ----------
+
+  void _pushUndo() {
+    _undo.add(result!.result.placed);
+    if (_undo.length > 60) _undo.removeAt(0);
+  }
+
+  // بيبني النتيجة من جديد بعد أي تعديل (لازم يتنادى جوه setState)
+  void _applyPlaced(List<Placed> np) {
+    final c = result!;
+    final loaded = List<int>.filled(c.items.length, 0);
+    for (final p in np) {
+      loaded[p.item] += p.units;
+    }
+    result = Calc(PackResult(np, loaded), c.L, c.W, c.H, c.payload, c.items,
+        manual: c.manual,
+        edited: true,
+        warnings: const [],
+        notes: const ['الترتيب معدّل بإيدك']);
+  }
+
+  int? _hit(Offset pos, double scale, double m) {
+    final x = (pos.dx - m) / scale, y = (pos.dy - LoadPainter.topPad) / scale;
+    final pl = result!.result.placed;
+    for (var i = pl.length - 1; i >= 0; i--) {
+      final p = pl[i];
+      if (x >= p.x && x <= p.x + p.w && y >= p.y && y <= p.y + p.h) return i;
+    }
+    return null;
+  }
+
+  void _moveTo(int i, double nx, double ny, double scale) {
+    final c = result!;
+    final pl = c.result.placed;
+    final p = pl[i];
+    var x = max(0.0, nx), y = max(0.0, ny);
+    if (snap) {
+      final th = 8 / scale; // 8 بكسل
+      var bestDx = th + 1, bestDy = th + 1;
+      var sx = x, sy = y;
+      final cx = x, cy = y;
+      void tryX(double cand) {
+        final d = (cand - cx).abs();
+        if (d <= th && d < bestDx) {
+          bestDx = d;
+          sx = cand;
+        }
+      }
+
+      void tryY(double cand) {
+        final d = (cand - cy).abs();
+        if (d <= th && d < bestDy) {
+          bestDy = d;
+          sy = cand;
+        }
+      }
+
+      tryX(0);
+      tryX(c.L - p.w);
+      tryY(0);
+      tryY(c.W - p.h);
+      for (var j = 0; j < pl.length; j++) {
+        if (j == i) continue;
+        final q = pl[j];
+        tryX(q.x + q.w);
+        tryX(q.x - p.w);
+        tryX(q.x);
+        tryY(q.y + q.h);
+        tryY(q.y - p.h);
+        tryY(q.y);
+      }
+      x = max(0.0, sx);
+      y = max(0.0, sy);
+    }
+    final np = [...pl];
+    np[i] = p.copyWith(x: x, y: y);
+    _applyPlaced(np);
+  }
+
+  void _nudge(double dx, double dy) {
+    final i = sel;
+    if (i == null) return;
+    final pl = result!.result.placed;
+    if (i >= pl.length) return;
+    setState(() {
+      _pushUndo();
+      final p = pl[i];
+      final np = [...pl];
+      np[i] = p.copyWith(
+          x: max(0.0, p.x + dx * _step), y: max(0.0, p.y + dy * _step));
+      _applyPlaced(np);
+    });
+  }
+
+  void _rotateSel() {
+    final i = sel;
+    if (i == null) return;
+    final pl = result!.result.placed;
+    if (i >= pl.length) return;
+    setState(() {
+      _pushUndo();
+      final p = pl[i];
+      final np = [...pl];
+      np[i] = p.copyWith(w: p.h, h: p.w);
+      _applyPlaced(np);
+    });
+  }
+
+  void _copySel() {
+    final i = sel;
+    if (i == null) return;
+    final pl = result!.result.placed;
+    if (i >= pl.length) return;
+    setState(() {
+      _pushUndo();
+      final p = pl[i];
+      final np = [...pl, p.copyWith(x: p.x + p.w)];
+      _applyPlaced(np);
+      sel = np.length - 1;
+    });
+  }
+
+  void _deleteSel() {
+    final i = sel;
+    if (i == null) return;
+    final pl = result!.result.placed;
+    if (i >= pl.length) return;
+    setState(() {
+      _pushUndo();
+      final np = [...pl]..removeAt(i);
+      _applyPlaced(np);
+      sel = null;
+    });
+  }
+
+  void _addColumn(int i) {
+    final c = result!;
+    final it = c.items[i];
+    final k = max(1, min(it.maxStack, (c.H / it.fh + 1e-9).floor()));
+    setState(() {
+      _pushUndo();
+      final np = [...c.result.placed, Placed(c.usedLen, 0, it.fl, it.fw, i, k)];
+      _applyPlaced(np);
+      sel = np.length - 1;
+    });
+  }
+
+  void _undoOnce() {
+    if (_undo.isEmpty) return;
+    setState(() {
+      final prev = _undo.removeLast();
+      _applyPlaced(prev);
+      sel = null;
     });
   }
 
@@ -1063,12 +1345,8 @@ class _PlannerPageState extends State<PlannerPage> {
       error = null;
     });
     try {
-      final reg = await PdfGoogleFonts.cairoRegular();
-      final bold = await PdfGoogleFonts.cairoBold();
       final bytes = await buildReport(
         c,
-        regular: reg,
-        bold: bold,
         customer: cCustomer.text.trim(),
         vehicleNo: cVehicleNo.text.trim(),
         vehicleType: preset,
@@ -1076,7 +1354,7 @@ class _PlannerPageState extends State<PlannerPage> {
       await Printing.sharePdf(bytes: bytes, filename: 'load_plan.pdf');
     } catch (e) {
       if (mounted) {
-        setState(() => error = 'تعذّر إنشاء الـ PDF (لازم إنترنت أول مرة): $e');
+        setState(() => error = 'تعذّر إنشاء الـ PDF: $e');
       }
     } finally {
       if (mounted) setState(() => exporting = false);
@@ -1139,6 +1417,7 @@ class _PlannerPageState extends State<PlannerPage> {
                   forms[i].dispose();
                   forms.removeAt(i);
                   result = null;
+                  _resetEdit();
                 }),
               ),
           ]),
@@ -1213,11 +1492,111 @@ class _PlannerPageState extends State<PlannerPage> {
     );
   }
 
+  // شريط أدوات التعديل بإيدك
+  Widget _editBar(Calc c) {
+    final pl = c.result.placed;
+    final p = (sel != null && sel! < pl.length) ? pl[sel!] : null;
+    final it = p == null ? null : c.items[p.item];
+    final has = p != null;
+
+    return Card(
+      color: Colors.amber.shade50,
+      child: Padding(
+        padding: const EdgeInsets.all(10),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(
+            has
+                ? 'المختار: ${it!.tag} (${p.units} أدوار) | ${_cm(p.w)}x${_cm(p.h)} سم | ${_cm(p.x)} سم من المقدمة و${_cm(p.y)} سم من الجنب'
+                : 'اضغط على جهاز لاختياره، أو اضغط ضغطة طويلة واسحبه عشان تحركه.',
+            style: const TextStyle(fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              const Text('خطوة الأسهم:'),
+              for (final s in [1, 5, 10])
+                ChoiceChip(
+                  label: Text('$s سم'),
+                  selected: _step == s,
+                  onSelected: (_) => setState(() => _step = s),
+                ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Center(
+            child: Directionality(
+              textDirection: TextDirection.ltr,
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                IconButton.filledTonal(
+                    onPressed: has ? () => _nudge(0, -1) : null,
+                    icon: const Icon(Icons.arrow_upward)),
+                Row(mainAxisSize: MainAxisSize.min, children: [
+                  IconButton.filledTonal(
+                      onPressed: has ? () => _nudge(-1, 0) : null,
+                      icon: const Icon(Icons.arrow_back)),
+                  IconButton.filledTonal(
+                      onPressed: has ? () => _nudge(0, 1) : null,
+                      icon: const Icon(Icons.arrow_downward)),
+                  IconButton.filledTonal(
+                      onPressed: has ? () => _nudge(1, 0) : null,
+                      icon: const Icon(Icons.arrow_forward)),
+                ]),
+              ]),
+            ),
+          ),
+          const Center(
+            child: Text('الشمال = ناحية مقدمة الحاوية، واليمين = ناحية الباب',
+                style: TextStyle(fontSize: 11, color: Colors.black54)),
+          ),
+          const SizedBox(height: 6),
+          Wrap(spacing: 8, runSpacing: 4, children: [
+            FilledButton.tonalIcon(
+                onPressed: has ? _rotateSel : null,
+                icon: const Icon(Icons.rotate_90_degrees_ccw),
+                label: const Text('لف 90°')),
+            FilledButton.tonalIcon(
+                onPressed: has ? _copySel : null,
+                icon: const Icon(Icons.copy),
+                label: const Text('نسخ')),
+            FilledButton.tonalIcon(
+                onPressed: has ? _deleteSel : null,
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('حذف')),
+            FilledButton.tonalIcon(
+                onPressed: _undo.isEmpty ? null : _undoOnce,
+                icon: const Icon(Icons.undo),
+                label: const Text('تراجع')),
+            PopupMenuButton<int>(
+              onSelected: _addColumn,
+              itemBuilder: (_) => [
+                for (var i = 0; i < c.items.length; i++)
+                  PopupMenuItem(
+                      value: i, child: Text('إضافة عمود: ${c.items[i].tag}')),
+              ],
+              child: const Chip(
+                  avatar: Icon(Icons.add), label: Text('إضافة عمود')),
+            ),
+          ]),
+          SwitchListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            value: snap,
+            onChanged: (v) => setState(() => snap = v),
+            title: const Text('مغناطيس (يلزق في الجدران والأجهزة)'),
+          ),
+        ]),
+      ),
+    );
+  }
+
   Widget _resultView(Calc c) {
     final r = c.result;
     final st = calcStats(c);
     final rem = max(0.0, c.L - st.usedLen);
     final over = c.overflow;
+    final ov = c.overlapIdx;
     final overweight = c.payload > 0 && st.weight > c.payload;
 
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1228,7 +1607,7 @@ class _PlannerPageState extends State<PlannerPage> {
           padding: const EdgeInsets.all(14),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text(
-                c.manual
+                c.manual || c.edited
                     ? 'إجمالي الأجهزة في ترتيبك: ${r.total} جهاز'
                     : 'إجمالي المحمّل: ${r.total} جهاز',
                 style:
@@ -1255,6 +1634,12 @@ class _PlannerPageState extends State<PlannerPage> {
                     fontWeight: FontWeight.bold,
                     color: rem > 0.5 ? Colors.green.shade800 : Colors.red),
               ),
+            if (ov.isNotEmpty)
+              Text(
+                'تنبيه: في ${ov.length} عمود متداخلين مع بعض (باللون الأحمر في الرسمة)',
+                style: const TextStyle(
+                    color: Colors.red, fontWeight: FontWeight.bold),
+              ),
             for (final w in c.warnings)
               Text('تنبيه: $w',
                   style: const TextStyle(
@@ -1267,6 +1652,15 @@ class _PlannerPageState extends State<PlannerPage> {
                   style: const TextStyle(
                       color: Colors.red, fontWeight: FontWeight.bold)),
             const Divider(),
+            if (c.notes.isNotEmpty) ...[
+              Text(
+                  c.edited
+                      ? 'حالة الترتيب:'
+                      : 'ترتيب التحميل (من تعليماتك):',
+                  style: const TextStyle(fontWeight: FontWeight.bold)),
+              for (final n in c.notes) Text(n),
+              const Divider(),
+            ],
             for (var i = 0; i < c.items.length; i++)
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 2),
@@ -1287,14 +1681,29 @@ class _PlannerPageState extends State<PlannerPage> {
       ),
       const SizedBox(height: 12),
       _title('الرسم (منظر علوي)'),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        value: editMode,
+        onChanged: (v) => setState(() {
+          editMode = v;
+          if (!v) {
+            sel = null;
+            _drag = null;
+          }
+        }),
+        title: const Text('تعديل الرسمة بإيدك (زي اللعبة)'),
+        subtitle: const Text(
+            'اضغط ضغطة طويلة على جهاز واسحبه. السحب العادي بيمرّر الرسمة.'),
+      ),
+      if (editMode) _editBar(c),
       Row(children: [
         const Icon(Icons.zoom_in),
         Expanded(
           child: Slider(
             value: zoom,
-            min: 0.5,
+            min: 0.3,
             max: 3.0,
-            divisions: 25,
+            divisions: 27,
             label: '${zoom.toStringAsFixed(1)}x',
             onChanged: (v) => setState(() => zoom = v),
           ),
@@ -1308,18 +1717,58 @@ class _PlannerPageState extends State<PlannerPage> {
         final scale = max(fit, 1.6) * zoom;
         final cw = totL * scale + 2 * m;
         final ch = LoadPainter.topPad + totW * scale + LoadPainter.bottomPad;
+
+        final canvasW = CustomPaint(
+          size: Size(cw, ch),
+          painter: LoadPainter(c.L, c.W, scale, m, r.placed, c.items,
+              sel: editMode ? (sel ?? -1) : -1, overlap: ov),
+        );
+
         return Card(
           child: SingleChildScrollView(
             scrollDirection: Axis.horizontal,
-            child: CustomPaint(
-              size: Size(cw, ch),
-              painter: LoadPainter(c.L, c.W, scale, m, r.placed, c.items),
-            ),
+            physics:
+                _drag != null ? const NeverScrollableScrollPhysics() : null,
+            child: editMode
+                ? GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTapUp: (d) => setState(
+                        () => sel = _hit(d.localPosition, scale, m)),
+                    onLongPressStart: (d) {
+                      final i = _hit(d.localPosition, scale, m);
+                      if (i == null) return;
+                      HapticFeedback.mediumImpact();
+                      setState(() {
+                        _pushUndo();
+                        sel = i;
+                        _drag = i;
+                        final p = result!.result.placed[i];
+                        _grab = Offset(
+                            (d.localPosition.dx - m) / scale - p.x,
+                            (d.localPosition.dy - LoadPainter.topPad) /
+                                    scale -
+                                p.y);
+                      });
+                    },
+                    onLongPressMoveUpdate: (d) {
+                      final i = _drag;
+                      if (i == null) return;
+                      final nx =
+                          (d.localPosition.dx - m) / scale - _grab.dx;
+                      final ny =
+                          (d.localPosition.dy - LoadPainter.topPad) / scale -
+                              _grab.dy;
+                      setState(() => _moveTo(i, nx, ny, scale));
+                    },
+                    onLongPressEnd: (_) => setState(() => _drag = null),
+                    child: canvasW,
+                  )
+                : canvasW,
           ),
         );
       }),
       const Text(
-          'المكتوب على كل جهاز = نوع الجهاز، وتحته عدد الأدوار. الخطوط المائلة = جهاز نايم. الخط الأحمر = ناحية الباب. الأحمر على الجهاز = خارج الحاوية. اسحب الرسم يمين وشمال أو كبّره بالـ slider.',
+          'المكتوب على كل جهاز = نوع الجهاز، وتحته عدد الأدوار. الخطوط المائلة = جهاز نايم. الخط الأحمر = ناحية الباب. الأحمر على الجهاز = خارج الحاوية أو متداخل. لو الحاوية طويلة صغّر الرسمة بالـ slider.',
           style: TextStyle(fontSize: 12, color: Colors.black54)),
       const SizedBox(height: 24),
     ]);
@@ -1331,6 +1780,9 @@ class _PlannerPageState extends State<PlannerPage> {
     final pose = it.pose == 1 ? '' : '  [${it.poseName}]';
     final nm = it.label.isEmpty ? it.name : '${it.name} (${it.label})';
 
+    if (c.edited) {
+      return '$nm: $got جهاز$pose';
+    }
     if (c.manual) {
       return '$nm: $got جهاز  (${min(it.maxStack, it.qty)} أدوار)$pose';
     }
@@ -1411,7 +1863,29 @@ class _PlannerPageState extends State<PlannerPage> {
             icon: const Icon(Icons.add),
             label: const Text('إضافة نوع جهاز تاني'),
           ),
-          const SizedBox(height: 12),
+          _title('تعليماتك بالكلام (اختياري)'),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: TextField(
+                controller: cInstr,
+                minLines: 3,
+                maxLines: 8,
+                decoration: const InputDecoration(
+                  border: OutlineInputBorder(),
+                  hintText:
+                      'سطر لكل جهاز، مثال:\nبوتاجاز 40 جهاز 3 جنب بعض 4 أدوار نايم ظهر\n50x80: 192 جهاز، 6 جنب بعض، 3 أدوار',
+                ),
+              ),
+            ),
+          ),
+          const Padding(
+            padding: EdgeInsets.only(bottom: 6),
+            child: Text(
+                'ابدأ السطر باسم الجهاز أو نوعه. الكلمات المفهومة: جهاز، جنب بعض، أدوار، واقف، نايم ظهر، نايم جنب، لف 90. اللي ما تكتبوش بيتاخد من الخانات. التعليمات دي للزر التاني بس.',
+                style: TextStyle(fontSize: 12, color: Colors.black54)),
+          ),
+          const SizedBox(height: 6),
           FilledButton.icon(
             onPressed: _calculate,
             icon: const Icon(Icons.auto_awesome),
@@ -1426,7 +1900,7 @@ class _PlannerPageState extends State<PlannerPage> {
           const Padding(
             padding: EdgeInsets.only(top: 6),
             child: Text(
-                'ترتيبك: الأجهزة بتتحمّل بترتيب القائمة من المقدمة للباب، وكل نوع في صفوف لوحده، والعدد لازم يتكتب. لو الطول زاد عن الحاوية هيتكتب لك بالسنتي.',
+                'ترتيبك: الأجهزة بتتحمّل من المقدمة للباب، وكل نوع في صفوف لوحده. لو الطول زاد عن الحاوية هيتكتب لك بالسنتي. وبعد الحساب تقدر تفعّل "تعديل الرسمة بإيدك" وتحرك الأجهزة.',
                 style: TextStyle(fontSize: 12, color: Colors.black54)),
           ),
           if (error != null)
@@ -1450,7 +1924,10 @@ class LoadPainter extends CustomPainter {
   final double L, W, scale, m;
   final List<Placed> placed;
   final List<ItemSpec> items;
-  LoadPainter(this.L, this.W, this.scale, this.m, this.placed, this.items);
+  final int sel; // العمود المختار (-1 = مفيش)
+  final Set<int> overlap; // الأعمدة المتداخلة
+  LoadPainter(this.L, this.W, this.scale, this.m, this.placed, this.items,
+      {this.sel = -1, this.overlap = const <int>{}});
 
   TextPainter _tp(String t, double fs, Color color) {
     return TextPainter(
@@ -1509,7 +1986,8 @@ class LoadPainter extends CustomPainter {
     }
 
     // الأجهزة
-    for (final p in placed) {
+    for (var pi = 0; pi < placed.length; pi++) {
+      final p = placed[pi];
       final it = items[p.item];
       final r = Rect.fromLTWH(m + p.x * s, topPad + p.y * s, p.w * s, p.h * s)
           .deflate(0.6);
@@ -1531,6 +2009,7 @@ class LoadPainter extends CustomPainter {
 
       final outLen = p.x + p.w > L + 0.5;
       final outWid = p.y + p.h > W + 0.5;
+      final ovl = overlap.contains(pi);
 
       // الجزء اللي طالع برّه الحاوية بالأحمر
       if (outLen) {
@@ -1538,19 +2017,37 @@ class LoadPainter extends CustomPainter {
         canvas.drawRect(Rect.fromLTRB(ox, r.top, r.right, r.bottom),
             Paint()..color = const Color(0x66FF0000));
       }
+      // المتداخل بالأحمر
+      if (ovl) {
+        canvas.drawRect(r, Paint()..color = const Color(0x55FF0000));
+      }
 
+      final bad = outLen || outWid || ovl;
       canvas.drawRect(
           r,
           Paint()
             ..style = PaintingStyle.stroke
-            ..strokeWidth = (outLen || outWid) ? 2.5 : 1
-            ..color = (outLen || outWid) ? Colors.red : Colors.black54);
+            ..strokeWidth = bad ? 2.5 : 1
+            ..color = bad ? Colors.red : Colors.black54);
 
       // نوع الجهاز + عدد الأدوار + الوضع (من غير المقاسات)
       final lines = <String>[it.tag];
       if (p.units > 1) lines.add('${p.units} أدوار');
       if (it.pose != 1) lines.add(it.poseShort);
       _label(canvas, r, lines, Colors.white);
+    }
+
+    // العمود المختار (إطار أصفر فوق كله)
+    if (sel >= 0 && sel < placed.length) {
+      final p = placed[sel];
+      final r = Rect.fromLTWH(m + p.x * s, topPad + p.y * s, p.w * s, p.h * s);
+      canvas.drawRect(r, Paint()..color = const Color(0x33FFC107));
+      canvas.drawRect(
+          r,
+          Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 3.5
+            ..color = const Color(0xFFFFB300));
     }
 
     // أرقام الصفوف فوق الرسمة
