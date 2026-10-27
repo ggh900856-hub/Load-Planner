@@ -101,7 +101,38 @@ class Calc {
   final PackResult result;
   final double L, W, H, payload;
   final List<ItemSpec> items;
-  Calc(this.result, this.L, this.W, this.H, this.payload, this.items);
+  final bool manual;
+  final List<String> warnings;
+  Calc(this.result, this.L, this.W, this.H, this.payload, this.items,
+      {this.manual = false, this.warnings = const []});
+
+  double get usedLen {
+    double u = 0;
+    for (final p in result.placed) {
+      u = max(u, p.x + p.w);
+    }
+    return u;
+  }
+
+  double get usedWid {
+    double u = 0;
+    for (final p in result.placed) {
+      u = max(u, p.y + p.h);
+    }
+    return u;
+  }
+
+  // الزيادة عن طول الحاوية (بالسنتي)
+  double get overflow => max(0.0, usedLen - L);
+
+  // عدد الأجهزة اللي خارج الحاوية أو بتعدّي الباب
+  int get outside {
+    var n = 0;
+    for (final p in result.placed) {
+      if (p.x + p.w > L + 0.5) n += p.units;
+    }
+    return n;
+  }
 }
 
 class FreeRect {
@@ -311,6 +342,51 @@ PackResult pack(double L, double W, double H, List<ItemSpec> items, int heur,
   return PackResult(placed, loaded);
 }
 
+/// الترتيب اليدوي (بتعليمات المستخدم): كل نوع في صفوف، بالترتيب من المقدمة للباب.
+/// مفيش حد للطول، لو زاد عن الحاوية بيتحسب ويتعرض كزيادة.
+(PackResult, List<String>) packManual(double W, double H,
+    List<ItemSpec> items, List<int> across, List<int> rot) {
+  final placed = <Placed>[];
+  final loaded = List<int>.filled(items.length, 0);
+  final warns = <String>[];
+  double x = 0;
+  for (var i = 0; i < items.length; i++) {
+    final it = items[i];
+    final rl = rot[i] == 2 ? it.fw : it.fl; // على طول الحاوية
+    final rw = rot[i] == 2 ? it.fl : it.fw; // على عرض الحاوية
+    final cols = (it.qty / it.maxStack).ceil();
+    var per = across[i] > 0 ? across[i] : (W / rw + 1e-9).floor();
+    if (per < 1) per = 1;
+    per = min(per, cols);
+
+    if (per * rw > W + 0.5) {
+      warns.add(
+          '${it.tag}: $per جهاز جنب بعض عرضهم ${_cm(per * rw)} سم، أكبر من عرض الحاوية بـ ${_cm(per * rw - W)} سم');
+    }
+    final need = min(it.maxStack, it.qty) * it.fh;
+    if (need > H + 0.5) {
+      warns.add(
+          '${it.tag}: ارتفاعه ${_cm(need)} سم، أكبر من ارتفاع الحاوية بـ ${_cm(need - H)} سم');
+    }
+
+    var remaining = it.qty;
+    var col = 0;
+    while (remaining > 0) {
+      final u = min(it.maxStack, remaining);
+      placed.add(Placed(x, col * rw, rl, rw, i, u));
+      loaded[i] += u;
+      remaining -= u;
+      col++;
+      if (col == per) {
+        col = 0;
+        x += rl;
+      }
+    }
+    if (col != 0) x += rl;
+  }
+  return (PackResult(placed, loaded), warns);
+}
+
 // ======================= تقرير PDF =======================
 
 PdfColor _pc(Color c) => PdfColor.fromInt(c.value);
@@ -340,9 +416,6 @@ String _dateNow() {
   return '${d.year}/${d.month.toString().padLeft(2, '0')}/${d.day.toString().padLeft(2, '0')}';
 }
 
-// المقاس في الـ PDF بحرف x عشان ما يتعكسش جوه النص العربي
-String _dm(double a, double b) => '${_n(a)}x${_n(b)}';
-
 String _rowText(RowInfo r, List<ItemSpec> items) {
   final parts = <String>[];
   r.units.forEach((i, u) {
@@ -355,16 +428,17 @@ String _rowText(RowInfo r, List<ItemSpec> items) {
 }
 
 pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
-  final s = min(maxW / c.L, maxH / c.W);
-  final cw = c.L * s, ch = c.W * s;
+  final used = c.usedLen;
+  final totL = max(c.L, used);
+  final totW = max(c.W, c.usedWid);
+  final s = min(maxW / totL, maxH / totW);
+  final cw = c.L * s, ch = c.W * s, tw = totL * s;
   const top = 16.0;
+  final baseY = top + totW * s;
   final kids = <pw.Widget>[];
 
-  double used = 0;
-  for (final p in c.result.placed) {
-    used = max(used, p.x + p.w);
-  }
   final rem = max(0.0, c.L - used);
+  final over = c.overflow;
 
   kids.add(pw.Positioned(
     left: 0,
@@ -415,6 +489,7 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
   for (final p in c.result.placed) {
     final it = c.items[p.item];
     final w = p.w * s, h = p.h * s;
+    final outside = p.x + p.w > c.L + 0.5 || p.y + p.h > c.W + 0.5;
     final lines = <String>[it.tag];
     if (p.units > 1) lines.add('${p.units} أدوار');
     if (it.pose != 1) lines.add(it.poseShort);
@@ -429,7 +504,9 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
         alignment: pw.Alignment.center,
         decoration: pw.BoxDecoration(
           color: _pc(it.color),
-          border: pw.Border.all(color: PdfColors.grey900, width: 0.5),
+          border: outside
+              ? pw.Border.all(color: PdfColors.red, width: 1.6)
+              : pw.Border.all(color: PdfColors.grey900, width: 0.5),
         ),
         child: show.isEmpty
             ? null
@@ -473,8 +550,8 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
     child: pw.Container(width: 4, height: ch, color: PdfColors.red),
   ));
   kids.add(pw.Positioned(
-    left: cw - 40,
-    top: top + ch + 4,
+    left: max(0.0, cw - 40),
+    top: baseY + 4,
     child: pw.Text('الباب',
         textDirection: pw.TextDirection.rtl,
         style: pw.TextStyle(
@@ -482,18 +559,18 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
   ));
   kids.add(pw.Positioned(
     left: 0,
-    top: top + ch + 4,
+    top: baseY + 4,
     child: pw.Text('مقدمة الحاوية (أول صف)',
         textDirection: pw.TextDirection.rtl,
         style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700)),
   ));
 
-  // خطوط القياس: المستخدم والمتبقي
+  // خطوط القياس
   List<pw.Widget> dim(
       double xa, double xb, double y, PdfColor col, String label) {
     final seg = max(xb - xa, 1.0);
     final lw = max(seg, 130.0);
-    final lx = max(0.0, min((xa + xb) / 2 - lw / 2, cw - lw));
+    final lx = max(0.0, min((xa + xb) / 2 - lw / 2, tw - lw));
     return [
       pw.Positioned(
           left: xa,
@@ -523,15 +600,18 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
     ];
   }
 
-  kids.addAll(dim(0, max(used * s, 2.0), top + ch + 28, PdfColors.indigo,
+  kids.addAll(dim(0, max(used * s, 2.0), baseY + 28, PdfColors.indigo,
       'المستخدم ${_cm(used)} سم'));
-  if (rem > 0.5) {
-    kids.addAll(dim(used * s, cw, top + ch + 58, PdfColors.green800,
+  if (over > 0.5) {
+    kids.addAll(dim(cw, used * s, baseY + 58, PdfColors.red,
+        'زيادة عن الحاوية ${_cm(over)} سم'));
+  } else if (rem > 0.5) {
+    kids.addAll(dim(used * s, cw, baseY + 58, PdfColors.green800,
         'المتبقي ${_cm(rem)} سم'));
   } else {
     kids.add(pw.Positioned(
       left: 0,
-      top: top + ch + 52,
+      top: baseY + 52,
       child: pw.Text('لا يوجد متبقي في طول الحاوية',
           textDirection: pw.TextDirection.rtl,
           style: pw.TextStyle(
@@ -542,8 +622,8 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
   }
 
   return pw.SizedBox(
-    width: cw,
-    height: top + ch + 84,
+    width: tw,
+    height: baseY + 84,
     child: pw.Stack(children: kids),
   );
 }
@@ -559,6 +639,7 @@ Future<Uint8List> buildReport(Calc c,
   final st = calcStats(c);
   final rows = buildRows(c.result.placed);
   final rem = max(0.0, c.L - st.usedLen);
+  final over = c.overflow;
   final overweight = c.payload > 0 && st.weight > c.payload;
   final hdrBg = PdfColors.grey300;
   final lblBg = PdfColors.grey200;
@@ -600,14 +681,15 @@ Future<Uint8List> buildReport(Calc c,
           pw.TableRow(children: [
             _c('مقاسات الحاوية (سم)', bold: true, bg: lblBg),
             _c('${_n(c.L)} x ${_n(c.W)} x ${_n(c.H)}', ltr: true),
-            _c('إجمالي المحمّل', bold: true, bg: lblBg),
+            _c('إجمالي الأجهزة', bold: true, bg: lblBg),
             _c('${c.result.total} جهاز', bold: true),
           ]),
           pw.TableRow(children: [
             _c('الطول المستخدم (سم)', bold: true, bg: lblBg),
             _c(_cm(st.usedLen), ltr: true),
-            _c('الطول المتبقي (سم)', bold: true, bg: lblBg),
-            _c(_cm(rem), ltr: true, bold: true),
+            _c(over > 0.5 ? 'الزيادة عن الحاوية (سم)' : 'الطول المتبقي (سم)',
+                bold: true, bg: lblBg),
+            _c(over > 0.5 ? _cm(over) : _cm(rem), ltr: true, bold: true),
           ]),
           pw.TableRow(children: [
             _c('استغلال الأرضية', bold: true, bg: lblBg),
@@ -623,6 +705,27 @@ Future<Uint8List> buildReport(Calc c,
           ]),
         ],
       ),
+      if (over > 0.5)
+        pw.Padding(
+          padding: const pw.EdgeInsets.only(top: 6),
+          child: pw.Text(
+              'تنبيه: الحمولة أطول من الحاوية بمقدار ${_cm(over)} سم (${c.outside} جهاز خارج الحاوية).',
+              textDirection: pw.TextDirection.rtl,
+              style: pw.TextStyle(
+                  color: PdfColors.red,
+                  fontSize: 11,
+                  fontWeight: pw.FontWeight.bold)),
+        ),
+      for (final w in c.warnings)
+        pw.Padding(
+          padding: const pw.EdgeInsets.only(top: 3),
+          child: pw.Text('تنبيه: $w',
+              textDirection: pw.TextDirection.rtl,
+              style: pw.TextStyle(
+                  color: PdfColors.red,
+                  fontSize: 10,
+                  fontWeight: pw.FontWeight.bold)),
+        ),
       if (overweight)
         pw.Padding(
           padding: const pw.EdgeInsets.only(top: 6),
@@ -755,7 +858,7 @@ Future<Uint8List> buildReport(Calc c,
           _topViewPdf(c, rows, 794, 290),
           pw.SizedBox(height: 6),
           pw.Text(
-              'الطول ${_n(c.L)} سم  -  العرض ${_n(c.W)} سم   |   الطول المستخدم ${_cm(st.usedLen)} سم   |   المتبقي ${_cm(rem)} سم',
+              'الطول ${_n(c.L)} سم  -  العرض ${_n(c.W)} سم   |   الطول المستخدم ${_cm(st.usedLen)} سم   |   ${over > 0.5 ? 'زيادة عن الحاوية ${_cm(over)} سم' : 'المتبقي ${_cm(rem)} سم'}',
               textDirection: pw.TextDirection.rtl,
               style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold)),
           pw.SizedBox(height: 10),
@@ -777,7 +880,7 @@ Future<Uint8List> buildReport(Calc c,
           ),
           pw.SizedBox(height: 10),
           pw.Text(
-              'الأرقام فوق الرسم = رقم الصف.  المكتوب على كل جهاز = نوع الجهاز وتحته عدد الأدوار.  الخط الأحمر = ناحية الباب.',
+              'الأرقام فوق الرسم = رقم الصف.  المكتوب على كل جهاز = نوع الجهاز وتحته عدد الأدوار.  الخط الأحمر = ناحية الباب.  الإطار الأحمر على الجهاز = خارج الحاوية.',
               textDirection: pw.TextDirection.rtl,
               style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700)),
         ],
@@ -799,9 +902,11 @@ class ItemForm {
   final qty = TextEditingController(text: '0');
   final stack = TextEditingController(text: '2');
   final weight = TextEditingController(text: '');
+  final across = TextEditingController(text: '0');
   int pose = 1; // 0 تلقائي، 1 واقف، 2 نايم واجهة/ظهر، 3 نايم جنب
+  int rot = 1; // 1 عادي، 2 لف 90° (للترتيب اليدوي)
   void dispose() {
-    for (final c in [name, label, l, w, h, qty, stack, weight]) {
+    for (final c in [name, label, l, w, h, qty, stack, weight, across]) {
       c.dispose();
     }
   }
@@ -856,12 +961,13 @@ class _PlannerPageState extends State<PlannerPage> {
     super.dispose();
   }
 
-  void _calculate() {
-    FocusScope.of(context).unfocus();
+  // بيقرا المدخلات ويتأكد منها. في الترتيب اليدوي لازم العدد يكون أكبر من 0.
+  ({double L, double W, double H, List<ItemSpec> items})? _readInputs(
+      {required bool manual}) {
     final L = _p(cL.text), W = _p(cW.text), H = _p(cH.text);
     if (L <= 0 || W <= 0 || H <= 0) {
       setState(() => error = 'دخّل مقاسات الحاوية أو السيارة صح');
-      return;
+      return null;
     }
     final items = <ItemSpec>[];
     for (var i = 0; i < forms.length; i++) {
@@ -869,7 +975,13 @@ class _PlannerPageState extends State<PlannerPage> {
       final l = _p(f.l.text), w = _p(f.w.text), h = _p(f.h.text);
       if (l <= 0 || w <= 0 || h <= 0) {
         setState(() => error = 'مقاسات الجهاز رقم ${i + 1} ناقصة');
-        return;
+        return null;
+      }
+      final qty = max(0, _p(f.qty.text).round());
+      if (manual && qty == 0) {
+        setState(() => error =
+            'في ترتيبك لازم تكتب العدد للجهاز رقم ${i + 1} (مش 0)');
+        return null;
       }
       items.add(ItemSpec(
         name: f.name.text.trim().isEmpty ? 'جهاز ${i + 1}' : f.name.text.trim(),
@@ -878,12 +990,21 @@ class _PlannerPageState extends State<PlannerPage> {
         w: w,
         h: h,
         weight: _p(f.weight.text),
-        qty: max(0, _p(f.qty.text).round()),
+        qty: qty,
         maxStack: max(1, _p(f.stack.text).round()),
         color: _colors[i % _colors.length],
         pose: f.pose,
       ));
     }
+    return (L: L, W: W, H: H, items: items);
+  }
+
+  // الترتيب التلقائي (أفضل ترتيب)
+  void _calculate() {
+    FocusScope.of(context).unfocus();
+    final inp = _readInputs(manual: false);
+    if (inp == null) return;
+    final L = inp.L, W = inp.W, H = inp.H, items = inp.items;
 
     // لو فيه أصناف "تلقائي" بنجرب كل وضع (واقف / نايم ظهر / نايم جنب)
     final variants = <List<ItemSpec>>[];
@@ -915,6 +1036,24 @@ class _PlannerPageState extends State<PlannerPage> {
     setState(() {
       error = null;
       result = Calc(finalBest, L, W, H, _p(cPayload.text), finalItems);
+    });
+  }
+
+  // الترتيب اليدوي (بتعليمات المستخدم)
+  void _calculateManual() {
+    FocusScope.of(context).unfocus();
+    final inp = _readInputs(manual: true);
+    if (inp == null) return;
+    final items = [
+      for (final e in inp.items) e.pose == 0 ? e.withPose(1) : e
+    ];
+    final across = [for (final f in forms) max(0, _p(f.across.text).round())];
+    final rot = [for (final f in forms) f.rot];
+    final (r, warns) = packManual(inp.W, inp.H, items, across, rot);
+    setState(() {
+      error = null;
+      result = Calc(r, inp.L, inp.W, inp.H, _p(cPayload.text), items,
+          manual: true, warnings: warns);
     });
   }
 
@@ -1042,6 +1181,33 @@ class _PlannerPageState extends State<PlannerPage> {
               ),
             ),
           ]),
+          const Divider(),
+          const Align(
+            alignment: Alignment.centerRight,
+            child: Text('تعليماتك (للزر "جرّب ترتيبي" بس)',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+          const SizedBox(height: 8),
+          Row(children: [
+            _field(f.across, 'عدد جنب بعض في العرض (0 = تلقائي)'),
+          ]),
+          const SizedBox(height: 4),
+          Row(children: [
+            const Text('اتجاه الجهاز:  '),
+            Expanded(
+              child: DropdownButton<int>(
+                isExpanded: true,
+                value: f.rot,
+                items: const [
+                  DropdownMenuItem(
+                      value: 1, child: Text('عادي (الطول على طول الحاوية)')),
+                  DropdownMenuItem(
+                      value: 2, child: Text('لف 90° (العرض على طول الحاوية)')),
+                ],
+                onChanged: (v) => setState(() => f.rot = v ?? 1),
+              ),
+            ),
+          ]),
         ]),
       ),
     );
@@ -1051,6 +1217,7 @@ class _PlannerPageState extends State<PlannerPage> {
     final r = c.result;
     final st = calcStats(c);
     final rem = max(0.0, c.L - st.usedLen);
+    final over = c.overflow;
     final overweight = c.payload > 0 && st.weight > c.payload;
 
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1060,22 +1227,38 @@ class _PlannerPageState extends State<PlannerPage> {
         child: Padding(
           padding: const EdgeInsets.all(14),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('إجمالي المحمّل: ${r.total} جهاز',
+            Text(
+                c.manual
+                    ? 'إجمالي الأجهزة في ترتيبك: ${r.total} جهاز'
+                    : 'إجمالي المحمّل: ${r.total} جهاز',
                 style:
                     const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
             const SizedBox(height: 6),
             Text(
                 'استغلال الأرضية: ${st.floorPct.toStringAsFixed(0)}%   |   استغلال الحجم: ${st.volPct.toStringAsFixed(0)}%'),
-            Text('الطول المستخدم: ${_cm(st.usedLen)} سم'),
-            Text(
-              rem > 0.5
-                  ? 'المتبقي من طول الحاوية: ${_cm(rem)} سم'
-                  : 'الحاوية ممتلئة طولياً (لا يوجد متبقي)',
-              style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                  color: rem > 0.5 ? Colors.green.shade800 : Colors.red),
-            ),
+            Text('الطول المستخدم: ${_cm(st.usedLen)} سم  (الحاوية ${_cm(c.L)} سم)'),
+            if (over > 0.5)
+              Text(
+                'تنبيه: الحمولة أطول من الحاوية بـ ${_cm(over)} سم، و${c.outside} جهاز خارج الحاوية',
+                style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.red),
+              )
+            else
+              Text(
+                rem > 0.5
+                    ? 'المتبقي من طول الحاوية: ${_cm(rem)} سم'
+                    : 'الحاوية ممتلئة طولياً (لا يوجد متبقي)',
+                style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: rem > 0.5 ? Colors.green.shade800 : Colors.red),
+              ),
+            for (final w in c.warnings)
+              Text('تنبيه: $w',
+                  style: const TextStyle(
+                      color: Colors.red, fontWeight: FontWeight.bold)),
             if (st.weight > 0)
               Text('الوزن الكلي: ${st.weight.toStringAsFixed(0)} كجم'),
             if (overweight)
@@ -1119,10 +1302,12 @@ class _PlannerPageState extends State<PlannerPage> {
       ]),
       LayoutBuilder(builder: (ctx, cons) {
         const m = 16.0;
-        final fit = (cons.maxWidth - 2 * m) / c.L;
+        final totL = max(c.L, c.usedLen);
+        final totW = max(c.W, c.usedWid);
+        final fit = (cons.maxWidth - 2 * m) / totL;
         final scale = max(fit, 1.6) * zoom;
-        final cw = c.L * scale + 2 * m;
-        final ch = LoadPainter.topPad + c.W * scale + LoadPainter.bottomPad;
+        final cw = totL * scale + 2 * m;
+        final ch = LoadPainter.topPad + totW * scale + LoadPainter.bottomPad;
         return Card(
           child: SingleChildScrollView(
             scrollDirection: Axis.horizontal,
@@ -1134,7 +1319,7 @@ class _PlannerPageState extends State<PlannerPage> {
         );
       }),
       const Text(
-          'المكتوب على كل جهاز = نوع الجهاز، وتحته عدد الأدوار. الخطوط المائلة = جهاز نايم. الخط الأحمر = ناحية الباب. اسحب الرسم يمين وشمال أو كبّره بالـ slider.',
+          'المكتوب على كل جهاز = نوع الجهاز، وتحته عدد الأدوار. الخطوط المائلة = جهاز نايم. الخط الأحمر = ناحية الباب. الأحمر على الجهاز = خارج الحاوية. اسحب الرسم يمين وشمال أو كبّره بالـ slider.',
           style: TextStyle(fontSize: 12, color: Colors.black54)),
       const SizedBox(height: 24),
     ]);
@@ -1145,6 +1330,11 @@ class _PlannerPageState extends State<PlannerPage> {
     final got = c.result.loaded[i];
     final pose = it.pose == 1 ? '' : '  [${it.poseName}]';
     final nm = it.label.isEmpty ? it.name : '${it.name} (${it.label})';
+
+    if (c.manual) {
+      return '$nm: $got جهاز  (${min(it.maxStack, it.qty)} أدوار)$pose';
+    }
+
     if (it.fh > c.H) {
       return '$nm: ارتفاعه بالوضع ده أكبر من ارتفاع الحاوية، مش هيدخل$pose';
     }
@@ -1225,7 +1415,19 @@ class _PlannerPageState extends State<PlannerPage> {
           FilledButton.icon(
             onPressed: _calculate,
             icon: const Icon(Icons.auto_awesome),
-            label: const Text('احسب أفضل ترتيب'),
+            label: const Text('احسب أفضل ترتيب (تلقائي)'),
+          ),
+          const SizedBox(height: 8),
+          FilledButton.tonalIcon(
+            onPressed: _calculateManual,
+            icon: const Icon(Icons.edit_note),
+            label: const Text('جرّب ترتيبي (بتعليماتي)'),
+          ),
+          const Padding(
+            padding: EdgeInsets.only(top: 6),
+            child: Text(
+                'ترتيبك: الأجهزة بتتحمّل بترتيب القائمة من المقدمة للباب، وكل نوع في صفوف لوحده، والعدد لازم يتكتب. لو الطول زاد عن الحاوية هيتكتب لك بالسنتي.',
+                style: TextStyle(fontSize: 12, color: Colors.black54)),
           ),
           if (error != null)
             Padding(
@@ -1290,11 +1492,14 @@ class LoadPainter extends CustomPainter {
     final cont = Rect.fromLTWH(m, topPad, L * s, W * s);
     canvas.drawRect(cont, Paint()..color = const Color(0xFFEEEEEE));
 
-    double used = 0;
+    double used = 0, usedW = 0;
     for (final p in placed) {
       used = max(used, p.x + p.w);
+      usedW = max(usedW, p.y + p.h);
     }
+    final totW = max(W, usedW);
     final rem = max(0.0, L - used);
+    final over = max(0.0, used - L);
 
     // المنطقة الفاضية
     if (rem > 0.5) {
@@ -1324,12 +1529,22 @@ class LoadPainter extends CustomPainter {
         canvas.restore();
       }
 
+      final outLen = p.x + p.w > L + 0.5;
+      final outWid = p.y + p.h > W + 0.5;
+
+      // الجزء اللي طالع برّه الحاوية بالأحمر
+      if (outLen) {
+        final ox = max(r.left, m + L * s);
+        canvas.drawRect(Rect.fromLTRB(ox, r.top, r.right, r.bottom),
+            Paint()..color = const Color(0x66FF0000));
+      }
+
       canvas.drawRect(
           r,
           Paint()
             ..style = PaintingStyle.stroke
-            ..strokeWidth = 1
-            ..color = Colors.black54);
+            ..strokeWidth = (outLen || outWid) ? 2.5 : 1
+            ..color = (outLen || outWid) ? Colors.red : Colors.black54);
 
       // نوع الجهاز + عدد الأدوار + الوضع (من غير المقاسات)
       final lines = <String>[it.tag];
@@ -1360,7 +1575,7 @@ class LoadPainter extends CustomPainter {
           ..color = Colors.red
           ..strokeWidth = 5);
 
-    // خطوط القياس: المستخدم والمتبقي
+    // خطوط القياس: المستخدم والمتبقي / الزيادة
     void dim(double xa, double xb, double y, String label, Color col) {
       final p = Paint()
         ..color = col
@@ -1371,12 +1586,15 @@ class LoadPainter extends CustomPainter {
       _text(canvas, label, Offset((xa + xb) / 2, y + 16), 13, col);
     }
 
-    final base = topPad + W * s;
+    final base = topPad + totW * s;
     final xUsed = m + used * s;
     final xEnd = m + L * s;
     dim(m, xUsed, base + 14, 'المستخدم ${_cm(used)} سم',
         const Color(0xFF283593));
-    if (rem > 0.5) {
+    if (over > 0.5) {
+      dim(xEnd, xUsed, base + 50, 'زيادة عن الحاوية ${_cm(over)} سم',
+          Colors.red);
+    } else if (rem > 0.5) {
       dim(xUsed, xEnd, base + 50, 'المتبقي ${_cm(rem)} سم',
           const Color(0xFF2E7D32));
     } else {
