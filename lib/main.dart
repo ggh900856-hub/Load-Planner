@@ -39,6 +39,7 @@ class LoadPlannerApp extends StatelessWidget {
 /// pose: 0 = تلقائي، 1 = واقف، 2 = نايم على الواجهة/الظهر، 3 = نايم على الجنب
 class ItemSpec {
   final String name;
+  final String label; // نوع الجهاز اللي بيظهر على الرسمة (مثلاً 60x90)
   final double l, w, h, weight;
   final int qty, maxStack, pose;
   final Color color;
@@ -51,11 +52,13 @@ class ItemSpec {
     required this.qty,
     required this.maxStack,
     required this.color,
+    this.label = '',
     this.pose = 1,
   });
 
   ItemSpec withPose(int p) => ItemSpec(
         name: name,
+        label: label,
         l: l,
         w: w,
         h: h,
@@ -70,6 +73,9 @@ class ItemSpec {
   double get fl => pose == 2 ? w : l;
   double get fw => pose == 1 ? w : h;
   double get fh => pose == 1 ? h : (pose == 2 ? l : w);
+
+  // اللي بيتكتب على الرسمة
+  String get tag => label.isNotEmpty ? label : name;
 
   String get poseName =>
       pose == 2 ? 'نايم على الواجهة/الظهر' : (pose == 3 ? 'نايم على الجنب' : 'واقف');
@@ -154,7 +160,18 @@ String _n(double v) =>
 
 String _cm(double v) => _n(double.parse(v.toStringAsFixed(1)));
 
-bool _isLtr(String t) => RegExp(r'^[0-9×x.]').hasMatch(t);
+// نص أرقام/إنجليزي بس (يتكتب شمال ليمين)، أي حاجة فيها عربي تتكتب يمين لشمال
+bool _isLtr(String t) => RegExp(r'^[0-9a-zA-Z×x*.\s/\-]+$').hasMatch(t);
+
+// بيوحّد شكل نوع الجهاز: أرقام إنجليزي وعلامة x بدل * و ×
+String _normLabel(String s) {
+  const ar = '٠١٢٣٤٥٦٧٨٩';
+  var t = s.trim();
+  for (var i = 0; i < 10; i++) {
+    t = t.replaceAll(ar[i], '$i');
+  }
+  return t.replaceAll(RegExp(r'[*×✕Xx]'), 'x');
+}
 
 // ======================= خوارزمية الترتيب (MaxRects) =======================
 
@@ -310,7 +327,7 @@ pw.Widget _c(String t,
     alignment: al,
     child: pw.Text(
       t,
-      textDirection: ltr ? pw.TextDirection.ltr : null,
+      textDirection: ltr ? pw.TextDirection.ltr : pw.TextDirection.rtl,
       style: pw.TextStyle(
           fontSize: fs,
           fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal),
@@ -323,13 +340,16 @@ String _dateNow() {
   return '${d.year}/${d.month.toString().padLeft(2, '0')}/${d.day.toString().padLeft(2, '0')}';
 }
 
+// المقاس في الـ PDF بحرف x عشان ما يتعكسش جوه النص العربي
+String _dm(double a, double b) => '${_n(a)}x${_n(b)}';
+
 String _rowText(RowInfo r, List<ItemSpec> items) {
   final parts = <String>[];
   r.units.forEach((i, u) {
     final it = items[i];
     final st = r.stacks[i] ?? 0;
     final pose = it.poseShort.isEmpty ? '' : ' (${it.poseShort})';
-    parts.add('${it.name} ${_n(it.fl)}×${_n(it.fw)}$pose: $u جهاز ($st عمود)');
+    parts.add('${it.tag}$pose: $u جهاز ($st عمود)');
   });
   return parts.join('   |   ');
 }
@@ -374,11 +394,13 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
                 mainAxisSize: pw.MainAxisSize.min,
                 children: [
                   pw.Text('فاضي',
+                      textDirection: pw.TextDirection.rtl,
                       style: pw.TextStyle(
                           fontSize: 8,
                           color: PdfColors.green900,
                           fontWeight: pw.FontWeight.bold)),
                   pw.Text('${_cm(rem)} سم',
+                      textDirection: pw.TextDirection.rtl,
                       style: pw.TextStyle(
                           fontSize: 8,
                           color: PdfColors.green900,
@@ -393,9 +415,9 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
   for (final p in c.result.placed) {
     final it = c.items[p.item];
     final w = p.w * s, h = p.h * s;
-    final lines = <String>['${_n(p.w)}×${_n(p.h)}'];
-    if (p.units > 1) lines.add('x${p.units}');
-    if (it.pose != 1 && w >= 30) lines.add(it.poseShort);
+    final lines = <String>[it.tag];
+    if (p.units > 1) lines.add('${p.units} أدوار');
+    if (it.pose != 1) lines.add(it.poseShort);
     final nLines = h >= 34 ? 3 : (h >= 22 ? 2 : (h >= 12 ? 1 : 0));
     final show = w >= 22 ? lines.take(nLines).toList() : <String>[];
     kids.add(pw.Positioned(
@@ -454,6 +476,7 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
     left: cw - 40,
     top: top + ch + 4,
     child: pw.Text('الباب',
+        textDirection: pw.TextDirection.rtl,
         style: pw.TextStyle(
             fontSize: 9, color: PdfColors.red, fontWeight: pw.FontWeight.bold)),
   ));
@@ -461,6 +484,7 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
     left: 0,
     top: top + ch + 4,
     child: pw.Text('مقدمة الحاوية (أول صف)',
+        textDirection: pw.TextDirection.rtl,
         style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700)),
   ));
 
@@ -490,6 +514,7 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
           width: lw,
           child: pw.Center(
             child: pw.Text(label,
+                textDirection: pw.TextDirection.rtl,
                 style: pw.TextStyle(
                     fontSize: 9, color: col, fontWeight: pw.FontWeight.bold)),
           ),
@@ -508,6 +533,7 @@ pw.Widget _topViewPdf(Calc c, List<RowInfo> rows, double maxW, double maxH) {
       left: 0,
       top: top + ch + 52,
       child: pw.Text('لا يوجد متبقي في طول الحاوية',
+          textDirection: pw.TextDirection.rtl,
           style: pw.TextStyle(
               fontSize: 9,
               color: PdfColors.red,
@@ -546,6 +572,7 @@ Future<Uint8List> buildReport(Calc c,
     build: (ctx) => [
       pw.Center(
         child: pw.Text('بيان تحميل',
+            textDirection: pw.TextDirection.rtl,
             style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
       ),
       pw.SizedBox(height: 10),
@@ -572,7 +599,7 @@ Future<Uint8List> buildReport(Calc c,
           ]),
           pw.TableRow(children: [
             _c('مقاسات الحاوية (سم)', bold: true, bg: lblBg),
-            _c('${_n(c.L)} × ${_n(c.W)} × ${_n(c.H)}', ltr: true),
+            _c('${_n(c.L)} x ${_n(c.W)} x ${_n(c.H)}', ltr: true),
             _c('إجمالي المحمّل', bold: true, bg: lblBg),
             _c('${c.result.total} جهاز', bold: true),
           ]),
@@ -600,6 +627,7 @@ Future<Uint8List> buildReport(Calc c,
         pw.Padding(
           padding: const pw.EdgeInsets.only(top: 6),
           child: pw.Text('تنبيه: الوزن الكلي أكبر من الحمولة القصوى!',
+              textDirection: pw.TextDirection.rtl,
               style: pw.TextStyle(
                   color: PdfColors.red,
                   fontSize: 11,
@@ -607,6 +635,7 @@ Future<Uint8List> buildReport(Calc c,
         ),
       pw.SizedBox(height: 14),
       pw.Text('ملخص الأنواع',
+          textDirection: pw.TextDirection.rtl,
           style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold)),
       pw.SizedBox(height: 4),
       pw.Table(
@@ -633,15 +662,17 @@ Future<Uint8List> buildReport(Calc c,
               _c('المطلوب', bold: true),
               _c('المحمّل', bold: true),
               _c('الباقي', bold: true),
-              _c('الطبقات', bold: true),
+              _c('الأدوار', bold: true),
               _c('الوزن (كجم)', bold: true),
             ],
           ),
           for (var i = 0; i < c.items.length; i++)
             pw.TableRow(children: [
               _c('${i + 1}', ltr: true),
-              _c(c.items[i].name),
-              _c('${_n(c.items[i].l)}×${_n(c.items[i].w)}×${_n(c.items[i].h)}',
+              _c(c.items[i].label.isEmpty
+                  ? c.items[i].name
+                  : '${c.items[i].name} (${c.items[i].label})'),
+              _c('${_n(c.items[i].l)}x${_n(c.items[i].w)}x${_n(c.items[i].h)}',
                   ltr: true),
               _c(c.items[i].poseName, fs: 8.5),
               _c(c.items[i].qty == 0 ? 'أقصى كمية' : '${c.items[i].qty}'),
@@ -658,6 +689,7 @@ Future<Uint8List> buildReport(Calc c,
       ),
       pw.SizedBox(height: 14),
       pw.Text('تفاصيل الصفوف (بالترتيب اللي بيتحمّل بيه)',
+          textDirection: pw.TextDirection.rtl,
           style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold)),
       pw.SizedBox(height: 4),
       pw.Table(
@@ -691,6 +723,7 @@ Future<Uint8List> buildReport(Calc c,
       pw.SizedBox(height: 8),
       pw.Text(
           'الصف رقم 1 هو أول صف بيتحمّل (ناحية مقدمة الحاوية)، وآخر صف عند الباب.',
+          textDirection: pw.TextDirection.rtl,
           style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700)),
     ],
   ));
@@ -709,10 +742,12 @@ Future<Uint8List> buildReport(Calc c,
             mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
             children: [
               pw.Text('رسم التحميل - منظر علوي',
+                  textDirection: pw.TextDirection.rtl,
                   style: pw.TextStyle(
                       fontSize: 18, fontWeight: pw.FontWeight.bold)),
               pw.Text(
                   '${customer.isEmpty ? '' : '$customer  -  '}$vehicleType  -  ${c.result.total} جهاز',
+                  textDirection: pw.TextDirection.rtl,
                   style: const pw.TextStyle(fontSize: 11)),
             ],
           ),
@@ -720,7 +755,8 @@ Future<Uint8List> buildReport(Calc c,
           _topViewPdf(c, rows, 794, 290),
           pw.SizedBox(height: 6),
           pw.Text(
-              'طول ${_n(c.L)} سم  ×  عرض ${_n(c.W)} سم   |   الطول المستخدم ${_cm(st.usedLen)} سم   |   المتبقي ${_cm(rem)} سم',
+              'الطول ${_n(c.L)} سم  -  العرض ${_n(c.W)} سم   |   الطول المستخدم ${_cm(st.usedLen)} سم   |   المتبقي ${_cm(rem)} سم',
+              textDirection: pw.TextDirection.rtl,
               style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold)),
           pw.SizedBox(height: 10),
           pw.Wrap(
@@ -733,14 +769,16 @@ Future<Uint8List> buildReport(Calc c,
                       width: 11, height: 11, color: _pc(c.items[i].color)),
                   pw.SizedBox(width: 5),
                   pw.Text(
-                      '${c.items[i].name}  (${_n(c.items[i].l)}×${_n(c.items[i].w)}×${_n(c.items[i].h)})${c.items[i].poseShort.isEmpty ? '' : '  [${c.items[i].poseShort}]'}  =  ${c.result.loaded[i]} جهاز',
+                      '${c.items[i].tag}${c.items[i].poseShort.isEmpty ? '' : ' (${c.items[i].poseShort})'}  =  ${c.result.loaded[i]} جهاز',
+                      textDirection: pw.TextDirection.rtl,
                       style: const pw.TextStyle(fontSize: 10)),
                 ]),
             ],
           ),
           pw.SizedBox(height: 10),
           pw.Text(
-              'الأرقام فوق الرسم = رقم الصف.  المكتوب على كل جهاز = (على طول الحاوية × على عرضها).  x2 = عمودين فوق بعض.  الخط الأحمر = ناحية الباب.',
+              'الأرقام فوق الرسم = رقم الصف.  المكتوب على كل جهاز = نوع الجهاز وتحته عدد الأدوار.  الخط الأحمر = ناحية الباب.',
+              textDirection: pw.TextDirection.rtl,
               style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700)),
         ],
       );
@@ -754,6 +792,7 @@ Future<Uint8List> buildReport(Calc c,
 
 class ItemForm {
   final name = TextEditingController(text: 'بوتاجاز');
+  final label = TextEditingController(text: '');
   final l = TextEditingController(text: '60');
   final w = TextEditingController(text: '60');
   final h = TextEditingController(text: '85');
@@ -762,7 +801,7 @@ class ItemForm {
   final weight = TextEditingController(text: '');
   int pose = 1; // 0 تلقائي، 1 واقف، 2 نايم واجهة/ظهر، 3 نايم جنب
   void dispose() {
-    for (final c in [name, l, w, h, qty, stack, weight]) {
+    for (final c in [name, label, l, w, h, qty, stack, weight]) {
       c.dispose();
     }
   }
@@ -834,6 +873,7 @@ class _PlannerPageState extends State<PlannerPage> {
       }
       items.add(ItemSpec(
         name: f.name.text.trim().isEmpty ? 'جهاز ${i + 1}' : f.name.text.trim(),
+        label: _normLabel(f.label.text),
         l: l,
         w: w,
         h: h,
@@ -965,6 +1005,10 @@ class _PlannerPageState extends State<PlannerPage> {
           ]),
           const SizedBox(height: 8),
           Row(children: [
+            _textField(f.label, 'نوع الجهاز (يظهر على الرسمة) مثال: 60x90'),
+          ]),
+          const SizedBox(height: 8),
+          Row(children: [
             _field(f.l, 'الطول'),
             const SizedBox(width: 8),
             _field(f.w, 'العرض'),
@@ -973,9 +1017,9 @@ class _PlannerPageState extends State<PlannerPage> {
           ]),
           const SizedBox(height: 8),
           Row(children: [
-            _field(f.qty, 'العدد (0 = أقصى كمية)'),
+            _field(f.stack, 'عدد الأدوار (فوق بعض)'),
             const SizedBox(width: 8),
-            _field(f.stack, 'أقصى طبقات'),
+            _field(f.qty, 'العدد (0 = أقصى كمية)'),
             const SizedBox(width: 8),
             _field(f.weight, 'الوزن كجم'),
           ]),
@@ -1090,9 +1134,7 @@ class _PlannerPageState extends State<PlannerPage> {
         );
       }),
       const Text(
-          'المكتوب على كل جهاز = (على طول الحاوية × على عرضها). الخطوط المائلة = جهاز نايم. الخط الأحمر = ناحية الباب. اسحب الرسم يمين وشمال أو كبّره بالـ slider.',
-          style: TextStyle(fontSize: 12, color: Colors.black54)),
-      const Text('×2 يعني عمودين فوق بعض في نفس المكان.',
+          'المكتوب على كل جهاز = نوع الجهاز، وتحته عدد الأدوار. الخطوط المائلة = جهاز نايم. الخط الأحمر = ناحية الباب. اسحب الرسم يمين وشمال أو كبّره بالـ slider.',
           style: TextStyle(fontSize: 12, color: Colors.black54)),
       const SizedBox(height: 24),
     ]);
@@ -1102,14 +1144,19 @@ class _PlannerPageState extends State<PlannerPage> {
     final it = c.items[i];
     final got = c.result.loaded[i];
     final pose = it.pose == 1 ? '' : '  [${it.poseName}]';
+    final nm = it.label.isEmpty ? it.name : '${it.name} (${it.label})';
     if (it.fh > c.H) {
-      return '${it.name}: ارتفاعه بالوضع ده أكبر من ارتفاع الحاوية، مش هيدخل$pose';
+      return '$nm: ارتفاعه بالوضع ده أكبر من ارتفاع الحاوية، مش هيدخل$pose';
     }
-    if (it.qty == 0) return '${it.name}: $got جهاز$pose';
+    final k = min(it.maxStack, (c.H / it.fh + 1e-9).floor());
+    final layers = k < it.maxStack
+        ? '  (الارتفاع بيسمح بـ $k أدوار بس)'
+        : '  ($k أدوار)';
+    if (it.qty == 0) return '$nm: $got جهاز$layers$pose';
     final left = it.qty - got;
     return left > 0
-        ? '${it.name}: $got من ${it.qty} (فاضل $left مش داخل)$pose'
-        : '${it.name}: $got من ${it.qty} (الكل دخل)$pose';
+        ? '$nm: $got من ${it.qty} (فاضل $left مش داخل)$layers$pose'
+        : '$nm: $got من ${it.qty} (الكل دخل)$layers$pose';
   }
 
   @override
@@ -1221,7 +1268,7 @@ class LoadPainter extends CustomPainter {
   /// يكتب عدة أسطر في نص المستطيل ويصغّر الخط لحد ما تتناسب
   void _label(Canvas canvas, Rect r, List<String> lines, Color color) {
     for (var n = lines.length; n >= 1; n--) {
-      for (double fs = 13; fs >= 7; fs -= 1) {
+      for (double fs = 14; fs >= 7; fs -= 1) {
         final tps = [for (var i = 0; i < n; i++) _tp(lines[i], fs, color)];
         final w = tps.map((t) => t.width).reduce((a, b) => a > b ? a : b);
         final h = tps.fold<double>(0, (a, t) => a + t.height);
@@ -1284,10 +1331,10 @@ class LoadPainter extends CustomPainter {
             ..strokeWidth = 1
             ..color = Colors.black54);
 
-      final lines = <String>['${_n(p.w)}×${_n(p.h)}'];
-      if (p.units > 1) lines.add('×${p.units}');
+      // نوع الجهاز + عدد الأدوار + الوضع (من غير المقاسات)
+      final lines = <String>[it.tag];
+      if (p.units > 1) lines.add('${p.units} أدوار');
       if (it.pose != 1) lines.add(it.poseShort);
-      lines.add(it.name);
       _label(canvas, r, lines, Colors.white);
     }
 
