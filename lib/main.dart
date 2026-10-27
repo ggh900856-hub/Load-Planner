@@ -269,7 +269,7 @@ PackResult pack(double L, double W, double H, List<ItemSpec> items, int heur,
 
 // ======================= تقرير PDF =======================
 
-PdfColor _pc(Color c) => PdfColor.fromInt(c.toARGB32());
+PdfColor _pc(Color c) => PdfColor.fromInt(c.value);
 
 pw.Widget _c(String t,
     {bool bold = false,
@@ -1071,3 +1071,4 @@ class LoadPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant LoadPainter old) => true;
+}
