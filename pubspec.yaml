@@ -1,5 +1,5 @@
-name: Load Planner
-description: مخطط تحميل الأجهزة على الحاويات والسيارات
+name: load_planner
+description: Load planner for devices on containers and vehicles
 publish_to: 'none'
 version: 1.0.0+1
 
