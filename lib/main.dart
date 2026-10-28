@@ -39,6 +39,7 @@ class LoadPlannerApp extends StatelessWidget {
 // ======================= النماذج =======================
 
 /// pose: 0 = تلقائي، 1 = واقف، 2 = نايم على الواجهة/الظهر، 3 = نايم على الجنب
+/// في الوضعين 2 و 3 الارتفاع بيبقى على عرض الحاوية (في الجنب)
 class ItemSpec {
   final String name;
   final String label; // نوع الجهاز اللي بيظهر على الرسمة (مثلاً 60x90)
@@ -74,9 +75,13 @@ class ItemSpec {
       );
 
   // أبعاد الأرضية (fl × fw) والارتفاع الفعلي (fh) حسب الوضع
-  double get fl => pose == 2 ? w : l;
+  // واقف:           الأرضية طول × عمق،  الارتفاع = h
+  // نايم ظهر/واجهة: الأرضية طول × h،    الارتفاع = العمق (w)
+  // نايم جنب:       الأرضية عمق × h،    الارتفاع = الطول (l)
+  // (في النايم: الـ h دايماً على عرض الحاوية)
+  double get fl => pose == 3 ? w : l;
   double get fw => pose == 1 ? w : h;
-  double get fh => pose == 1 ? h : (pose == 2 ? l : w);
+  double get fh => pose == 1 ? h : (pose == 3 ? l : w);
 
   // اللي بيتكتب على الرسمة
   String get tag => label.isNotEmpty ? label : name;
@@ -99,10 +104,27 @@ class Placed {
 class PackResult {
   final List<Placed> placed;
   final List<int> loaded;
-  PackResult(this.placed, this.loaded);
+  // عدد الأجهزة اللي خارج الحسبة (الباقي من قسمة العدد على الأدوار) لكل صنف
+  final List<int> extra;
+  PackResult(this.placed, this.loaded, [List<int>? extra])
+      : extra = extra ?? List<int>.filled(loaded.length, 0);
+
   int get total => loaded.fold(0, (a, b) => a + b);
-  bool betterThan(PackResult o) =>
-      total > o.total || (total == o.total && placed.length < o.placed.length);
+  int get totalExtra => extra.fold(0, (a, b) => a + b);
+
+  double get usedLen {
+    double u = 0;
+    for (final p in placed) {
+      u = max(u, p.x + p.w);
+    }
+    return u;
+  }
+
+  bool betterThan(PackResult o) {
+    if (total != o.total) return total > o.total;
+    if ((usedLen - o.usedLen).abs() > 0.5) return usedLen < o.usedLen;
+    return placed.length < o.placed.length;
+  }
 }
 
 class Calc {
@@ -147,8 +169,18 @@ class Calc {
     return n;
   }
 
+  // عدد الأدوار الفعلي في العمود الكامل للصنف رقم i
+  int layersOf(int i) {
+    final it = items[i];
+    if (manual) return max(1, it.maxStack);
+    return max(1, min(it.maxStack, (H / it.fh + 1e-9).floor()));
+  }
+
   // أرقام الأعمدة المتداخلة مع بعض
   late final Set<int> overlapIdx = _calcOverlap();
+
+  // حسبة إمكانية إضافة دور (بتتحسب مرة واحدة بس عند الطلب)
+  late final List<LayerOpt> layerOpts = calcLayerOpts(this);
 
   Set<int> _calcOverlap() {
     final s = <int>{};
@@ -252,6 +284,19 @@ String _n(double v) =>
     v == v.roundToDouble() ? v.round().toString() : v.toStringAsFixed(1);
 
 String _cm(double v) => _n(double.parse(v.toStringAsFixed(1)));
+
+String _ord(int n) {
+  const m = {
+    2: 'ثاني',
+    3: 'ثالث',
+    4: 'رابع',
+    5: 'خامس',
+    6: 'سادس',
+    7: 'سابع',
+    8: 'ثامن',
+  };
+  return m[n] ?? '$n';
+}
 
 // نص أرقام/إنجليزي بس (يتكتب شمال ليمين)، أي حاجة فيها عربي تتكتب يمين لشمال
 bool _isLtr(String t) => RegExp(r'^[0-9a-zA-Z×x*.\s/\-]+$').hasMatch(t);
@@ -494,6 +539,9 @@ class MaxRects {
   }
 }
 
+/// الترتيب التلقائي. العدد بيتقسّم على أعمدة كاملة (كل عمود = عدد الأدوار كامل).
+/// الباقي من القسمة بيتحسب "خارج الحسبة" ومش بيتحط.
+/// استثناء: لو العدد أقل من عدد الأدوار بيتحط عمود واحد بالعدد ده.
 PackResult pack(double L, double W, double H, List<ItemSpec> items, int heur,
     int rotMode, int order) {
   final bin = MaxRects(L, W);
@@ -511,36 +559,72 @@ PackResult pack(double L, double W, double H, List<ItemSpec> items, int heur,
   });
   final placed = <Placed>[];
   final loaded = List<int>.filled(items.length, 0);
+  final extra = List<int>.filled(items.length, 0);
   for (final i in idx) {
     final it = items[i];
     final k = min(it.maxStack, (H / it.fh + 1e-9).floor());
     if (k < 1) continue;
-    var remaining = it.qty <= 0 ? (1 << 30) : it.qty;
-    while (remaining > 0) {
+    int cols;
+    var lastUnits = k;
+    if (it.qty <= 0) {
+      cols = 1 << 30; // أقصى كمية
+    } else if (it.qty < k) {
+      cols = 1;
+      lastUnits = it.qty;
+    } else {
+      cols = it.qty ~/ k;
+      extra[i] = it.qty - cols * k;
+    }
+    while (cols > 0) {
       final r = bin.insert(it.fl, it.fw, rotMode, heur);
       if (r == null) break;
-      final u = min(k, remaining);
+      final u = cols == 1 ? lastUnits : k;
       placed.add(Placed(r.x, r.y, r.w, r.h, i, u));
       loaded[i] += u;
-      remaining -= u;
+      cols--;
     }
   }
-  return PackResult(placed, loaded);
+  return PackResult(placed, loaded, extra);
+}
+
+/// أحسن ترتيب تلقائي (بيجرب كل الطرق والاتجاهات)
+PackResult _bestPack(double L, double W, double H, List<ItemSpec> items) {
+  PackResult? best;
+  for (var heur = 0; heur < 3; heur++) {
+    for (var rot = 0; rot < 3; rot++) {
+      for (var order = 0; order < 2; order++) {
+        final r = pack(L, W, H, items, heur, rot, order);
+        if (best == null || r.betterThan(best)) best = r;
+      }
+    }
+  }
+  return best!;
 }
 
 /// الترتيب اليدوي (بتعليمات المستخدم): كل نوع في صفوف، بالترتيب من المقدمة للباب.
 /// مفيش حد للطول، لو زاد عن الحاوية بيتحسب ويتعرض كزيادة.
+/// العدد بيتقسّم أعمدة كاملة والباقي خارج الحسبة.
 (PackResult, List<String>) packManual(double W, double H,
     List<ItemSpec> items, List<int> across, List<int> rot) {
   final placed = <Placed>[];
   final loaded = List<int>.filled(items.length, 0);
+  final extra = List<int>.filled(items.length, 0);
   final warns = <String>[];
   double x = 0;
   for (var i = 0; i < items.length; i++) {
     final it = items[i];
     final rl = rot[i] == 2 ? it.fw : it.fl; // على طول الحاوية
     final rw = rot[i] == 2 ? it.fl : it.fw; // على عرض الحاوية
-    final cols = (it.qty / it.maxStack).ceil();
+    final k = it.maxStack;
+    int cols;
+    var lastUnits = k;
+    if (it.qty < k) {
+      cols = 1;
+      lastUnits = it.qty;
+    } else {
+      cols = it.qty ~/ k;
+      extra[i] = it.qty - cols * k;
+    }
     var per = across[i] > 0 ? across[i] : (W / rw + 1e-9).floor();
     if (per < 1) per = 1;
     per = min(per, cols);
@@ -549,19 +633,17 @@ PackResult pack(double L, double W, double H, List<ItemSpec> items, int heur,
       warns.add(
           '${it.tag}: $per جهاز جنب بعض عرضهم ${_cm(per * rw)} سم، أكبر من عرض الحاوية بـ ${_cm(per * rw - W)} سم');
     }
-    final need = min(it.maxStack, it.qty) * it.fh;
+    final need = min(k, it.qty) * it.fh;
     if (need > H + 0.5) {
       warns.add(
           '${it.tag}: ارتفاعه ${_cm(need)} سم، أكبر من ارتفاع الحاوية بـ ${_cm(need - H)} سم');
     }
 
-    var remaining = it.qty;
     var col = 0;
-    while (remaining > 0) {
-      final u = min(it.maxStack, remaining);
+    for (var c = 0; c < cols; c++) {
+      final u = (c == cols - 1) ? lastUnits : k;
       placed.add(Placed(x, col * rw, rl, rw, i, u));
       loaded[i] += u;
-      remaining -= u;
       col++;
       if (col == per) {
         col = 0;
@@ -570,7 +652,40 @@ PackResult pack(double L, double W, double H, List<ItemSpec> items, int heur,
     }
     if (col != 0) x += rl;
   }
-  return (PackResult(placed, loaded), warns);
+  return (PackResult(placed, loaded, extra), warns);
+}
+
+// ======================= حسبة إمكانية إضافة دور =======================
+
+class LayerOpt {
+  final int item, next;
+  final double need;
+  final bool fits;
+  final PackResult base;
+  final PackResult? alt;
+  LayerOpt(this.item, this.next, this.need, this.fits, this.base, this.alt);
+}
+
+/// لكل صنف: لو زوّدنا دور واحد عليه لوحده، ينفع ولا لا؟ وإيه الفرق في الطول والعدد؟
+/// المقارنة بالترتيب التلقائي لنفس الأعداد.
+List<LayerOpt> calcLayerOpts(Calc c) {
+  final base = _bestPack(c.L, c.W, c.H, c.items);
+  final out = <LayerOpt>[];
+  for (var i = 0; i < c.items.length; i++) {
+    final it = c.items[i];
+    final next = it.maxStack + 1;
+    final need = next * it.fh;
+    if (need > c.H + 0.5) {
+      out.add(LayerOpt(i, next, need, false, base, null));
+      continue;
+    }
+    final alt = [
+      for (var j = 0; j < c.items.length; j++)
+        j == i ? c.items[j].copy(maxStack: next) : c.items[j]
+    ];
+    out.add(LayerOpt(i, next, need, true, base, _bestPack(c.L, c.W, c.H, alt)));
+  }
+  return out;
 }
 
 // ======================= تقرير PDF (بيترسم زي الشاشة) =======================
@@ -735,6 +850,7 @@ Future<Uint8List> buildReport(Calc c,
   const lblBg = Color(0xFFEEEEEE);
   const hdrBg = Color(0xFFE0E0E0);
   const red = Color(0xFFC62828);
+  const orange = Color(0xFFE65100);
 
   _Cell lc(String t) => _Cell(t, bold: true, bg: lblBg);
   _Cell vc(String t, {bool bold = false}) => _Cell(t, bold: bold);
@@ -806,6 +922,16 @@ Future<Uint8List> buildReport(Calc c,
   if (overweight) {
     g1.para('تنبيه: الوزن الكلي أكبر من الحمولة القصوى!',
         fs: 11, bold: true, color: red);
+  }
+  for (var i = 0; i < c.items.length; i++) {
+    final ex = c.result.extra[i];
+    if (ex > 0) {
+      g1.para(
+          'خارج الحسبة: ${c.items[i].tag}: $ex جهاز (العدد ${c.items[i].qty} مش بيتقسم على ${c.layersOf(i)} أدوار)',
+          fs: 10.5,
+          bold: true,
+          color: orange);
+    }
   }
 
   g1.gap(12);
@@ -1103,16 +1229,10 @@ class _PlannerPageState extends State<PlannerPage> {
     PackResult? best;
     List<ItemSpec> bestItems = items;
     for (final v in variants) {
-      for (var heur = 0; heur < 3; heur++) {
-        for (var rot = 0; rot < 3; rot++) {
-          for (var order = 0; order < 2; order++) {
-            final r = pack(L, W, H, v, heur, rot, order);
-            if (best == null || r.betterThan(best)) {
-              best = r;
-              bestItems = v;
-            }
-          }
-        }
+      final r = _bestPack(L, W, H, v);
+      if (best == null || r.betterThan(best)) {
+        best = r;
+        bestItems = v;
       }
     }
     final finalBest = best!;
@@ -1196,13 +1316,17 @@ class _PlannerPageState extends State<PlannerPage> {
     final notes = <String>[];
     for (var k = 0; k < items.length; k++) {
       final it = items[k];
+      final st = it.maxStack;
+      final cols = it.qty < st ? 1 : it.qty ~/ st;
+      final perCol = it.qty < st ? it.qty : st;
       final parts = <String>[
         '${it.qty} جهاز',
+        '$cols عمود × $perCol أدوار',
         acr[k] > 0 ? '${acr[k]} جنب بعض' : 'جنب بعض تلقائي',
-        '${it.maxStack} أدوار',
       ];
       if (it.pose != 1) parts.add(it.poseShort);
       if (rt[k] == 2) parts.add('ملفوف 90°');
+      if (r.extra[k] > 0) parts.add('${r.extra[k]} خارج الحسبة');
       notes.add('${k + 1}. ${it.tag}: ${parts.join('، ')}');
     }
 
@@ -1735,6 +1859,66 @@ class _PlannerPageState extends State<PlannerPage> {
     );
   }
 
+  // مربع إمكانية إضافة دور (حسبة منفصلة)
+  Widget _layerBox(Calc c) {
+    final opts = c.layerOpts;
+    final all3 = c.items.every((e) => e.maxStack == 3);
+    final title =
+        all3 ? 'إمكانية إضافة دور رابع' : 'إمكانية إضافة دور زيادة';
+
+    Widget row(LayerOpt o) {
+      final it = c.items[o.item];
+      final head = '${it.tag}: الدور ${_ord(o.next)}';
+      if (!o.fits) {
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Text(
+              '$head: مش هينفع. ارتفاع ${o.next} أدوار = ${_cm(o.need)} سم، أكبر من ارتفاع الحاوية (${_cm(c.H)} سم) بـ ${_cm(o.need - c.H)} سم',
+              style: const TextStyle(color: Colors.red)),
+        );
+      }
+      final b = o.base, a = o.alt!;
+      final dl = b.usedLen - a.usedLen;
+      final dlTxt = dl > 0.5
+          ? '(توفير ${_cm(dl)} سم)'
+          : (dl < -0.5 ? '(زيادة ${_cm(-dl)} سم)' : '(نفس الطول)');
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('$head: ينفع',
+              style: TextStyle(
+                  fontWeight: FontWeight.bold, color: Colors.green.shade800)),
+          Text(
+              'الارتفاع ${_cm(o.need)} سم من ${_cm(c.H)} سم (فاضل ${_cm(c.H - o.need)} سم)'),
+          Text('الأجهزة المحمّلة: من ${b.total} إلى ${a.total}'),
+          Text(
+              'الطول المستخدم: من ${_cm(b.usedLen)} إلى ${_cm(a.usedLen)} سم $dlTxt'),
+          if (b.extra[o.item] > 0 || a.extra[o.item] > 0)
+            Text(
+                'خارج الحسبة: من ${b.extra[o.item]} إلى ${a.extra[o.item]} جهاز'),
+        ]),
+      );
+    }
+
+    return Card(
+      color: Colors.blueGrey.shade50,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(title,
+              style:
+                  const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 4),
+          const Text(
+              'حسبة منفصلة: بنزوّد دور واحد على كل صنف لوحده ونقارن بالترتيب التلقائي لنفس الأعداد.',
+              style: TextStyle(fontSize: 12, color: Colors.black54)),
+          const Divider(),
+          for (final o in opts) row(o),
+        ]),
+      ),
+    );
+  }
+
   Widget _resultView(Calc c) {
     final r = c.result;
     final st = calcStats(c);
@@ -1788,6 +1972,13 @@ class _PlannerPageState extends State<PlannerPage> {
               Text('تنبيه: $w',
                   style: const TextStyle(
                       color: Colors.red, fontWeight: FontWeight.bold)),
+            for (var i = 0; i < c.items.length; i++)
+              if (r.extra[i] > 0)
+                Text(
+                    'خارج الحسبة: ${c.items[i].tag}: ${r.extra[i]} جهاز (العدد ${c.items[i].qty} مش بيتقسم على ${c.layersOf(i)} أدوار)',
+                    style: TextStyle(
+                        color: Colors.deepOrange.shade800,
+                        fontWeight: FontWeight.bold)),
             if (st.weight > 0)
               Text('الوزن الكلي: ${st.weight.toStringAsFixed(0)} كجم'),
             if (overweight)
@@ -1817,6 +2008,10 @@ class _PlannerPageState extends State<PlannerPage> {
           ]),
         ),
       ),
+      if (!c.edited) ...[
+        const SizedBox(height: 8),
+        _layerBox(c),
+      ],
       const SizedBox(height: 10),
       FilledButton.icon(
         onPressed: exporting ? null : () => _exportPdf(c),
@@ -1939,6 +2134,8 @@ class _PlannerPageState extends State<PlannerPage> {
   String _itemLine(Calc c, int i) {
     final it = c.items[i];
     final got = c.result.loaded[i];
+    final ex = c.result.extra[i];
+    final exTxt = ex > 0 ? '  |  $ex جهاز خارج الحسبة' : '';
     final pose = it.pose == 1 ? '' : '  [${it.poseName}]';
     final nm = it.label.isEmpty ? it.name : '${it.name} (${it.label})';
 
@@ -1953,7 +2150,7 @@ class _PlannerPageState extends State<PlannerPage> {
       return '$nm: $got جهاز$pose';
     }
     if (c.manual) {
-      return '$nm: $got جهاز  (${min(it.maxStack, it.qty)} أدوار)$pose';
+      return '$nm: $got جهاز  (${min(it.maxStack, it.qty)} أدوار)$pose$exTxt';
     }
 
     if (it.fh > c.H) {
@@ -1964,10 +2161,9 @@ class _PlannerPageState extends State<PlannerPage> {
         ? '  (الارتفاع بيسمح بـ $k أدوار بس)'
         : '  ($k أدوار)';
     if (it.qty == 0) return '$nm: $got جهاز$layers$pose';
-    final left = it.qty - got;
-    return left > 0
-        ? '$nm: $got من ${it.qty} (فاضل $left مش داخل)$layers$pose'
-        : '$nm: $got من ${it.qty} (الكل دخل)$layers$pose';
+    final left = it.qty - got - ex;
+    final tail = left > 0 ? '(فاضل $left مش داخل)' : '(كل الأعمدة دخلت)';
+    return '$nm: $got من ${it.qty} $tail$layers$pose$exTxt';
   }
 
   @override
@@ -2075,7 +2271,7 @@ class _PlannerPageState extends State<PlannerPage> {
           const Padding(
             padding: EdgeInsets.only(top: 6),
             child: Text(
-                'ترتيبك: الأجهزة بتتحمّل من المقدمة للباب، وكل نوع في صفوف لوحده. لو الطول زاد عن الحاوية هيتكتب لك بالسنتي. "افضي الحاوية" بيفتح رسمة فاضية وإنت بتضيف الأعمدة وتحركها بإيدك.',
+                'العدد بيتوزع أعمدة كاملة بعدد الأدوار، واللي بيفضل من القسمة بيتكتب "خارج الحسبة". ترتيبك: الأجهزة بتتحمّل من المقدمة للباب، وكل نوع في صفوف لوحده. لو الطول زاد عن الحاوية هيتكتب لك بالسنتي. "افضي الحاوية" بيفتح رسمة فاضية وإنت بتضيف الأعمدة وتحركها بإيدك.',
                 style: TextStyle(fontSize: 12, color: Colors.black54)),
           ),
           if (error != null)
